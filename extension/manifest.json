@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Avala Tracker Pro",
+  "version": "1.0.0",
+  "description": "Local analytics tracker for avala.ai annotation productivity.",
+  "permissions": ["tabs", "storage"],
+  "host_permissions": [
+    "https://avala.ai/*",
+    "https://*.avala.ai/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://avala.ai/*", "https://*.avala.ai/*"],
+      "js": ["task_detector.js", "content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
