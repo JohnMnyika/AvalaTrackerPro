@@ -93,3 +93,17 @@ def heatmap_tasks(df: pd.DataFrame):
     )
     fig.update_layout(title="Productivity Heatmap (GitHub Style)", xaxis_title="ISO Week", yaxis_title="Day")
     return fig
+
+
+def bar_period_metric(df: pd.DataFrame, x_col: str, y_col: str, title: str):
+    if df.empty:
+        return go.Figure()
+    fig = px.bar(df, x=x_col, y=y_col, title=title)
+    return fig
+
+
+def line_period_metric(df: pd.DataFrame, x_col: str, y_col: str, title: str):
+    if df.empty:
+        return go.Figure()
+    fig = px.line(df, x=x_col, y=y_col, markers=True, title=title)
+    return fig

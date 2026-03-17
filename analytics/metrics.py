@@ -5,8 +5,10 @@ from datetime import date
 from pathlib import Path
 
 import pandas as pd
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from backend.models import FrameLog
 from backend.models import Session as WorkSession
 from backend.models import Task
 
@@ -56,10 +58,56 @@ def _sessions_df(db: Session) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _annotation_totals(db: Session, today_str: str) -> dict:
+    created_total = db.query(func.sum(FrameLog.annotations_created)).scalar() or 0
+    deleted_total = db.query(func.sum(FrameLog.annotations_deleted)).scalar() or 0
+
+    created_today = (
+        db.query(func.sum(FrameLog.annotations_created))
+        .filter(func.date(FrameLog.timestamp) == today_str)
+        .scalar()
+        or 0
+    )
+    deleted_today = (
+        db.query(func.sum(FrameLog.annotations_deleted))
+        .filter(func.date(FrameLog.timestamp) == today_str)
+        .scalar()
+        or 0
+    )
+
+    return {
+        "boxes_annotated_total": int(created_total),
+        "boxes_deleted_total": int(deleted_total),
+        "boxes_annotated_today": int(created_today),
+        "boxes_deleted_today": int(deleted_today),
+    }
+
+
+def _frame_counts(db: Session, today_str: str) -> dict:
+    total_frames_logged = (
+        db.query(func.count(func.distinct(FrameLog.frame_number))).scalar() or 0
+    )
+    frames_today = (
+        db.query(func.count(func.distinct(FrameLog.frame_number)))
+        .filter(func.date(FrameLog.timestamp) == today_str)
+        .scalar()
+        or 0
+    )
+    return {
+        "frames_logged_total": int(total_frames_logged),
+        "frames_logged_today": int(frames_today),
+    }
+
+
 def compute_core_metrics(db: Session) -> dict:
     tasks = _tasks_df(db)
     sessions = _sessions_df(db)
     cfg = _load_config()
+
+    today = date.today()
+    today_str = str(today)
+    annotation_stats = _annotation_totals(db, today_str)
+    frame_stats = _frame_counts(db, today_str)
 
     if tasks.empty:
         return {
@@ -73,14 +121,20 @@ def compute_core_metrics(db: Session) -> dict:
             "tasks_completed_today": 0,
             "hours_worked_today": 0.0,
             "earnings": {"daily": 0.0, "weekly": 0.0, "monthly_projection": 0.0},
+            **annotation_stats,
         }
 
     tasks["created_at"] = pd.to_datetime(tasks["created_at"]) if "created_at" in tasks else pd.Series()
-    today = pd.Timestamp(date.today())
+    tasks_today = tasks[tasks["created_at"].dt.date == today]
 
-    tasks_today = tasks[tasks["created_at"].dt.date == today.date()]
+    # Prefer frame logs for accurate counts; fall back to tasks totals if no logs.
+    total_frames = frame_stats["frames_logged_total"]
+    frames_today = frame_stats["frames_logged_today"]
+    if total_frames == 0:
+        total_frames = int(tasks["total_frames"].fillna(0).sum())
+    if frames_today == 0 and not tasks_today.empty:
+        frames_today = int(tasks_today["total_frames"].fillna(0).sum())
 
-    total_frames = int(tasks["total_frames"].fillna(0).sum())
     total_active_hours = (
         float(sessions["active_minutes"].fillna(0).sum()) / 60.0 if not sessions.empty else 0.0
     )
@@ -91,7 +145,6 @@ def compute_core_metrics(db: Session) -> dict:
     )
 
     hours_today = 0.0
-    frames_today = int(tasks_today["total_frames"].fillna(0).sum()) if not tasks_today.empty else 0
     if not sessions.empty and not tasks_today.empty:
         today_task_ids = set(tasks_today["id"].tolist())
         hours_today = (
@@ -110,7 +163,7 @@ def compute_core_metrics(db: Session) -> dict:
         "efficiency_ratio": round(efficiency_ratio, 3),
         "dataset_distribution": tasks["dataset"].fillna("unknown").value_counts().to_dict(),
         "camera_distribution": tasks["camera_name"].fillna("unknown").value_counts().to_dict(),
-        "frames_annotated_today": frames_today,
+        "frames_annotated_today": int(frames_today),
         "tasks_completed_today": int(len(tasks_today)),
         "hours_worked_today": round(hours_today, 2),
         "earnings": {
@@ -118,4 +171,5 @@ def compute_core_metrics(db: Session) -> dict:
             "weekly": round(daily_earnings * 5, 2),
             "monthly_projection": round(daily_earnings * 22, 2),
         },
+        **annotation_stats,
     }

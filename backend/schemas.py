@@ -17,6 +17,17 @@ class TaskStartRequest(BaseModel):
     expected_hours: Optional[float] = None
 
 
+class TaskUpdateRequest(BaseModel):
+    task_uid: str = Field(..., min_length=4)
+    dataset: Optional[str] = None
+    sequence_id: Optional[str] = None
+    camera: Optional[str] = None
+    frame_start: Optional[int] = None
+    frame_end: Optional[int] = None
+    total_frames: Optional[int] = None
+    expected_hours: Optional[float] = None
+
+
 class TaskEndRequest(BaseModel):
     task_uid: str
 

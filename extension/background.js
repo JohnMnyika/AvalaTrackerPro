@@ -23,6 +23,10 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
     post("/task/start", msg.payload);
   }
 
+  if (msg.type === "TASK_UPDATE" && msg.payload) {
+    post("/task/update", msg.payload);
+  }
+
   if (msg.type === "FRAME_LOG" && msg.payload) {
     post("/frame/log", msg.payload);
   }

@@ -5,6 +5,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
+from backend.models import FrameLog
 from backend.models import Session as WorkSession
 from backend.models import Task
 
@@ -28,6 +29,78 @@ def best_working_hours(db: Session) -> list[dict]:
         avg_frames = sum(frames) / max(len(frames), 1)
         results.append({"hour": hour, "avg_frames": round(avg_frames, 2)})
     return sorted(results, key=lambda x: x["avg_frames"], reverse=True)
+
+
+def build_period_summaries(db: Session) -> dict:
+    tasks = db.query(Task).all()
+    sessions = db.query(WorkSession).all()
+    logs = db.query(FrameLog).all()
+
+    weekly = defaultdict(lambda: {"tasks": 0, "frames": 0, "hours": 0.0, "boxes": 0, "expected": 0.0})
+    monthly = defaultdict(lambda: {"tasks": 0, "frames": 0, "hours": 0.0, "boxes": 0, "expected": 0.0})
+
+    for t in tasks:
+        if not t.created_at:
+            continue
+        iso = t.created_at.isocalendar()
+        week_key = f"{iso.year}-W{iso.week:02d}"
+        month_key = f"{t.created_at.year}-{t.created_at.month:02d}"
+        weekly[week_key]["tasks"] += 1
+        weekly[week_key]["frames"] += int(t.total_frames or 0)
+        weekly[week_key]["expected"] += float(t.expected_hours or 0)
+        monthly[month_key]["tasks"] += 1
+        monthly[month_key]["frames"] += int(t.total_frames or 0)
+        monthly[month_key]["expected"] += float(t.expected_hours or 0)
+
+    for s in sessions:
+        if not s.start_time:
+            continue
+        iso = s.start_time.isocalendar()
+        week_key = f"{iso.year}-W{iso.week:02d}"
+        month_key = f"{s.start_time.year}-{s.start_time.month:02d}"
+        weekly[week_key]["hours"] += float(s.active_minutes or 0) / 60.0
+        monthly[month_key]["hours"] += float(s.active_minutes or 0) / 60.0
+
+    for log in logs:
+        if not log.timestamp:
+            continue
+        iso = log.timestamp.isocalendar()
+        week_key = f"{iso.year}-W{iso.week:02d}"
+        month_key = f"{log.timestamp.year}-{log.timestamp.month:02d}"
+        weekly[week_key]["boxes"] += int(log.annotations_created or 0)
+        monthly[month_key]["boxes"] += int(log.annotations_created or 0)
+
+    weekly_list = []
+    for k, v in sorted(weekly.items()):
+        actual = max(v["hours"], 1e-6)
+        eff = v["expected"] / actual if v["expected"] > 0 else 0.0
+        weekly_list.append(
+            {
+                "period": k,
+                "tasks_completed": v["tasks"],
+                "frames_annotated": v["frames"],
+                "hours_worked": round(v["hours"], 2),
+                "boxes_annotated": v["boxes"],
+                "efficiency_ratio": round(eff, 3),
+            }
+        )
+
+    monthly_list = []
+    for k, v in sorted(monthly.items()):
+        actual = max(v["hours"], 1e-6)
+        eff = v["expected"] / actual if v["expected"] > 0 else 0.0
+        monthly_list.append(
+            {
+                "period": k,
+                "tasks_completed": v["tasks"],
+                "frames_annotated": v["frames"],
+                "hours_worked": round(v["hours"], 2),
+                "boxes_annotated": v["boxes"],
+                "efficiency_ratio": round(eff, 3),
+            }
+        )
+
+    return {"weekly": weekly_list, "monthly": monthly_list}
 
 
 def build_performance_insights(db: Session) -> dict:

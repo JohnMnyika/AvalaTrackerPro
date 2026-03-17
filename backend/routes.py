@@ -19,19 +19,50 @@ from backend.schemas import (
     SessionResponse,
     TaskEndRequest,
     TaskStartRequest,
+    TaskUpdateRequest,
 )
 from tracker.frame_tracker import calculate_frame_speed
 
 router = APIRouter()
-SYNTHETIC_TASK_UID_RE = re.compile(r"^task-[0-9a-f]{5,}$")
 
 # Set from main.py at startup.
 session_manager = None
+SYNTHETIC_TASK_UID_RE = re.compile(r"^task-[0-9a-f]{5,}$")
 
 
 @router.get("/health")
 def health_check():
     return {"status": "ok", "service": "Avala Tracker Pro"}
+
+
+def _update_task_fields(task: Task, payload: TaskUpdateRequest | TaskStartRequest) -> bool:
+    changed = False
+    if getattr(payload, "dataset", None) and task.dataset != payload.dataset:
+        task.dataset = payload.dataset
+        changed = True
+    if getattr(payload, "camera", None) and task.camera_name != payload.camera:
+        task.camera_name = payload.camera
+        changed = True
+    if getattr(payload, "sequence_id", None):
+        # sequence_id stored in dataset metadata is not persisted in DB currently.
+        pass
+    if getattr(payload, "frame_start", None) is not None and payload.frame_start > 0:
+        if task.frame_start != payload.frame_start:
+            task.frame_start = payload.frame_start
+            changed = True
+    if getattr(payload, "frame_end", None) is not None and payload.frame_end > 0:
+        if task.frame_end != payload.frame_end:
+            task.frame_end = payload.frame_end
+            changed = True
+    if getattr(payload, "total_frames", None) is not None and payload.total_frames > 0:
+        if task.total_frames != payload.total_frames:
+            task.total_frames = payload.total_frames
+            changed = True
+    if getattr(payload, "expected_hours", None) is not None and payload.expected_hours > 0:
+        if task.expected_hours != payload.expected_hours:
+            task.expected_hours = payload.expected_hours
+            changed = True
+    return changed
 
 
 @router.post("/task/start", response_model=SessionResponse)
@@ -53,6 +84,7 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
             .order_by(Task.created_at.desc())
             .first()
         )
+
     if task is None:
         task = Task(
             task_uid=payload.task_uid,
@@ -66,6 +98,10 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
         db.add(task)
         db.commit()
         db.refresh(task)
+    else:
+        if _update_task_fields(task, payload):
+            db.commit()
+            db.refresh(task)
 
     session = session_manager.start_session(db, payload.task_uid)
     return SessionResponse(
@@ -78,6 +114,16 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
         frames_completed=session.frames_completed,
         efficiency_score=session.efficiency_score,
     )
+
+
+@router.post("/task/update", response_model=GenericResponse)
+def update_task(payload: TaskUpdateRequest, db: Session = Depends(get_db)):
+    task = db.query(Task).filter(Task.task_uid == payload.task_uid).first()
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    if _update_task_fields(task, payload):
+        db.commit()
+    return GenericResponse(status="ok", detail="Task updated")
 
 
 @router.post("/task/end", response_model=GenericResponse)
