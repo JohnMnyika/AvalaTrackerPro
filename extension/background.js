@@ -35,6 +35,10 @@ chrome.runtime.onMessage.addListener((msg, sender) => {
     post("/activity/ping", { source: "extension", active: !!msg.payload.active });
   }
 
+  if (msg.type === "CONTRIBUTIONS_SYNC" && msg.payload) {
+    post("/contributions/sync", msg.payload);
+  }
+
   if (msg.type === "TASK_END" && msg.payload) {
     post("/task/end", msg.payload);
   }

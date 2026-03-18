@@ -1,6 +1,6 @@
 {
   "idle_threshold_seconds": 300,
-  "rate_per_hour": 7.0,
+  "rate_per_hour": 3.0,
   "rate_per_task": 0.0,
   "currency": "USD"
 }

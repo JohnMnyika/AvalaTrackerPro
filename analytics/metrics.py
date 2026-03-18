@@ -8,7 +8,7 @@ import pandas as pd
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from backend.models import FrameLog
+from backend.models import ContributionDay, FrameLog
 from backend.models import Session as WorkSession
 from backend.models import Task
 
@@ -18,7 +18,7 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "settings.json
 def _load_config() -> dict:
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text())
-    return {"rate_per_hour": 7.0, "rate_per_task": 0.0}
+    return {"rate_per_hour": 3.0, "rate_per_task": 0.0}
 
 
 def _tasks_df(db: Session) -> pd.DataFrame:
@@ -59,6 +59,21 @@ def _sessions_df(db: Session) -> pd.DataFrame:
 
 
 def _annotation_totals(db: Session, today_str: str) -> dict:
+    contribution_rows = db.query(ContributionDay).all()
+    if contribution_rows:
+        created_total = sum(int(row.boxes_count or 0) for row in contribution_rows)
+        created_today = sum(
+            int(row.boxes_count or 0)
+            for row in contribution_rows
+            if row.contribution_date and row.contribution_date.isoformat() == today_str
+        )
+        return {
+            "boxes_annotated_total": int(created_total),
+            "boxes_deleted_total": 0,
+            "boxes_annotated_today": int(created_today),
+            "boxes_deleted_today": 0,
+        }
+
     created_total = db.query(func.sum(FrameLog.annotations_created)).scalar() or 0
     deleted_total = db.query(func.sum(FrameLog.annotations_deleted)).scalar() or 0
 
@@ -152,7 +167,7 @@ def compute_core_metrics(db: Session) -> dict:
             / 60.0
         )
 
-    rate_per_hour = float(cfg.get("rate_per_hour", 7.0))
+    rate_per_hour = float(cfg.get("rate_per_hour", 3.0))
     rate_per_task = float(cfg.get("rate_per_task", 0.0))
     daily_earnings = (hours_today * rate_per_hour) + (len(tasks_today) * rate_per_task)
 

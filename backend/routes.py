@@ -10,10 +10,11 @@ from sqlalchemy.orm import Session
 from analytics.metrics import compute_core_metrics
 from analytics.productivity import build_heatmap_data, build_performance_insights
 from backend.database import get_db
-from backend.models import FrameLog, Session as WorkSession
+from backend.models import ContributionDay, FrameLog, Session as WorkSession
 from backend.models import Task
 from backend.schemas import (
     ActivityPingRequest,
+    ContributionSyncRequest,
     FrameLogRequest,
     GenericResponse,
     SessionResponse,
@@ -177,6 +178,34 @@ def log_frame(payload: FrameLogRequest, db: Session = Depends(get_db)):
 
     db.commit()
     return GenericResponse(status="ok", detail="Frame event logged")
+
+
+@router.post("/contributions/sync", response_model=GenericResponse)
+def sync_contributions(payload: ContributionSyncRequest, db: Session = Depends(get_db)):
+    synced = 0
+    for item in payload.days:
+        contribution_date = item.contribution_date.date()
+        record = (
+            db.query(ContributionDay)
+            .filter(ContributionDay.contribution_date == contribution_date)
+            .first()
+        )
+        if record is None:
+            record = ContributionDay(
+                contribution_date=contribution_date,
+                boxes_count=max(int(item.boxes_count or 0), 0),
+                source=item.source or "profile",
+                captured_at=datetime.utcnow(),
+            )
+            db.add(record)
+        else:
+            record.boxes_count = max(int(item.boxes_count or 0), 0)
+            record.source = item.source or record.source
+            record.captured_at = datetime.utcnow()
+        synced += 1
+
+    db.commit()
+    return GenericResponse(status="ok", detail=f"Synced {synced} contribution days")
 
 
 @router.get("/analytics/overview")

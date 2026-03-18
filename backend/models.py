@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
-from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import Column, Date, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
 from .database import Base
@@ -52,3 +52,13 @@ class FrameLog(Base):
     annotations_deleted = Column(Integer, default=0, nullable=False)
 
     task = relationship("Task", back_populates="frame_logs")
+
+
+class ContributionDay(Base):
+    __tablename__ = "contribution_days"
+
+    id = Column(Integer, primary_key=True, index=True)
+    contribution_date = Column(Date, unique=True, index=True, nullable=False)
+    boxes_count = Column(Integer, default=0, nullable=False)
+    source = Column(String, default="profile", nullable=False)
+    captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)

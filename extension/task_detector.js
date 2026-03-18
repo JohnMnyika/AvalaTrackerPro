@@ -22,6 +22,16 @@
     }
   }
 
+  function isProfileUrl(url) {
+    try {
+      const u = new URL(url);
+      if (!hostLooksLikeAvala(u.hostname)) return false;
+      return /^\/@/i.test(u.pathname);
+    } catch (_err) {
+      return false;
+    }
+  }
+
   function parseFrameRangeFromLoad(loadValue) {
     if (!loadValue) return null;
     const match = loadValue.match(/(\d+)\s*-\s*(\d+)/);
@@ -47,12 +57,7 @@
   function normalizeCameraName(cameraRaw) {
     if (!cameraRaw) return null;
     const cam = cameraRaw.trim();
-    const map = {
-      "FWC_L": "FWC_L (CAM 07)",
-      "FWC_R": "FWC_R (CAM 08)",
-      "FWC_C": "FWC_C (CAM 06)"
-    };
-    return map[cam] || cam;
+    return cam.replace(/\s*\(CAM\s*\d+\)\s*$/i, "");
   }
 
   function parseTaskFromUrl(url) {
@@ -183,10 +188,54 @@
     return count > 0 ? count : null;
   }
 
+  function parseContributionLabel(label) {
+    if (!label) return null;
+    const text = String(label).replace(/\s+/g, " ").trim();
+    const match = text.match(/(\d+)\s+(?:contributions?|boxes?|annotations?).*?on\s+([A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})/i);
+    if (!match) return null;
+    const count = Number(match[1]);
+    const parsedDate = new Date(match[2].replace(/,/g, ""));
+    if (!Number.isFinite(count) || Number.isNaN(parsedDate.getTime())) return null;
+    return {
+      contribution_date: parsedDate.toISOString(),
+      boxes_count: count,
+      source: "profile"
+    };
+  }
+
+  function extractContributionDaysFromDom() {
+    const elements = document.querySelectorAll("[title], [aria-label], [data-tooltip], rect");
+    const days = [];
+    const seen = new Set();
+
+    for (const el of elements) {
+      const candidates = [
+        el.getAttribute && el.getAttribute("title"),
+        el.getAttribute && el.getAttribute("aria-label"),
+        el.getAttribute && el.getAttribute("data-tooltip"),
+        el.dataset && el.dataset.tooltip,
+        el.textContent
+      ];
+
+      for (const candidate of candidates) {
+        const parsed = parseContributionLabel(candidate);
+        if (!parsed) continue;
+        const key = `${parsed.contribution_date}|${parsed.boxes_count}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        days.push(parsed);
+      }
+    }
+
+    return days;
+  }
+
   window.AvalaTaskDetector = {
     isTaskUrl,
+    isProfileUrl,
     parseTaskFromUrl,
     extractFrameNumberFromDom,
-    extractAnnotationCountFromDom
+    extractAnnotationCountFromDom,
+    extractContributionDaysFromDom
   };
 })();

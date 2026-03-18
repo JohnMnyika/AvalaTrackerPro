@@ -5,7 +5,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from backend.models import FrameLog
+from backend.models import ContributionDay, FrameLog
 from backend.models import Session as WorkSession
 from backend.models import Task
 
@@ -35,6 +35,7 @@ def build_period_summaries(db: Session) -> dict:
     tasks = db.query(Task).all()
     sessions = db.query(WorkSession).all()
     logs = db.query(FrameLog).all()
+    contribution_days = db.query(ContributionDay).all()
 
     weekly = defaultdict(lambda: {"tasks": 0, "frames": 0, "hours": 0.0, "boxes": 0, "expected": 0.0})
     monthly = defaultdict(lambda: {"tasks": 0, "frames": 0, "hours": 0.0, "boxes": 0, "expected": 0.0})
@@ -61,14 +62,24 @@ def build_period_summaries(db: Session) -> dict:
         weekly[week_key]["hours"] += float(s.active_minutes or 0) / 60.0
         monthly[month_key]["hours"] += float(s.active_minutes or 0) / 60.0
 
-    for log in logs:
-        if not log.timestamp:
-            continue
-        iso = log.timestamp.isocalendar()
-        week_key = f"{iso.year}-W{iso.week:02d}"
-        month_key = f"{log.timestamp.year}-{log.timestamp.month:02d}"
-        weekly[week_key]["boxes"] += int(log.annotations_created or 0)
-        monthly[month_key]["boxes"] += int(log.annotations_created or 0)
+    if contribution_days:
+        for row in contribution_days:
+            if not row.contribution_date:
+                continue
+            iso = row.contribution_date.isocalendar()
+            week_key = f"{iso.year}-W{iso.week:02d}"
+            month_key = f"{row.contribution_date.year}-{row.contribution_date.month:02d}"
+            weekly[week_key]["boxes"] += int(row.boxes_count or 0)
+            monthly[month_key]["boxes"] += int(row.boxes_count or 0)
+    else:
+        for log in logs:
+            if not log.timestamp:
+                continue
+            iso = log.timestamp.isocalendar()
+            week_key = f"{iso.year}-W{iso.week:02d}"
+            month_key = f"{log.timestamp.year}-{log.timestamp.month:02d}"
+            weekly[week_key]["boxes"] += int(log.annotations_created or 0)
+            monthly[month_key]["boxes"] += int(log.annotations_created or 0)
 
     weekly_list = []
     for k, v in sorted(weekly.items()):

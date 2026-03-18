@@ -8,6 +8,7 @@
   let lastFrame = null;
   let lastAnnotationCount = null;
   let lastFrameChangeTs = 0;
+  let lastContributionSyncHash = null;
 
   function send(type, payload) {
     try {
@@ -41,6 +42,16 @@
   function sendTaskUpdate(update) {
     if (!update || !update.task_uid) return;
     send("TASK_UPDATE", update);
+  }
+
+  function syncContributionDays() {
+    if (!detector.isProfileUrl(window.location.href)) return;
+    const days = detector.extractContributionDaysFromDom();
+    if (!days || !days.length) return;
+    const nextHash = JSON.stringify(days);
+    if (nextHash === lastContributionSyncHash) return;
+    lastContributionSyncHash = nextHash;
+    send("CONTRIBUTIONS_SYNC", { days });
   }
 
   const emitFrameIfChanged = () => {
@@ -423,6 +434,7 @@
     handleUrlChange();
     emitFrameIfChanged();
     emitAnnotationDelta();
+    syncContributionDays();
   });
   observer.observe(document.documentElement, {
     childList: true,
@@ -444,4 +456,6 @@
   setInterval(emitFrameIfChanged, 3000);
   setInterval(emitAnnotationDelta, 2000);
   setInterval(pollGlobalStore, 3000);
+  setInterval(syncContributionDays, 4000);
+  syncContributionDays();
 })();

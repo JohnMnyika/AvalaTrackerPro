@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend import routes
-from backend.database import Base, engine
+from backend.database import ensure_schema
 from backend.session_manager import SessionManager
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "settings.json"
@@ -40,7 +40,7 @@ app.include_router(routes.router)
 
 @app.on_event("startup")
 def on_startup() -> None:
-    Base.metadata.create_all(bind=engine)
+    ensure_schema()
     session_manager.start()
 
 
