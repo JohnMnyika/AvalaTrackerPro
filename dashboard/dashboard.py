@@ -817,7 +817,7 @@ if current_view == "dashboard":
             if dataset_minutes:
                 st.plotly_chart(
                     style_figure(
-                        pie_distribution(dataset_minutes, "Hours Per Dataset"),
+                        pie_distribution(dataset_minutes, "Hours per Dataset"),
                         accent="#ff9800",
                     ),
                     width='stretch',

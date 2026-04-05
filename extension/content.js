@@ -184,6 +184,8 @@
     }
     const parsed = detector.parseTaskFromUrl(url);
     if (!parsed) return;
+    // Skip tracking unknown-dataset or unknown camera tasks
+    if (parsed.dataset === "unknown-dataset" || parsed.camera === "unknown") return;
     taskPayload = parsed;
     lastFrame = null;
     lastAnnotationCount = null;
@@ -203,12 +205,17 @@
     const nextParsed = detector.isTaskUrl(next) ? detector.parseTaskFromUrl(next) : null;
     const nextUid = nextParsed ? nextParsed.task_uid : null;
 
+    // Skip tracking unknown-dataset or unknown camera tasks
+    const isUnknown = nextParsed && (nextParsed.dataset === "unknown-dataset" || nextParsed.camera === "unknown");
+
     // Ignore SPA URL churn that keeps the same logical task.
     if (startedTaskUid && nextUid && startedTaskUid === nextUid) {
       currentUrl = next;
-      taskPayload = nextParsed;
-      if (nextParsed && Number.isFinite(nextParsed.preview_frame)) {
-        emitFrameFromPreview(nextParsed.preview_frame);
+      if (!isUnknown) {
+        taskPayload = nextParsed;
+        if (nextParsed && Number.isFinite(nextParsed.preview_frame)) {
+          emitFrameFromPreview(nextParsed.preview_frame);
+        }
       }
       return;
     }
@@ -217,7 +224,7 @@
     currentUrl = next;
     startedTaskUid = null;
     lastAnnotationCount = null;
-    if (nextParsed) {
+    if (nextParsed && !isUnknown) {
       taskPayload = nextParsed;
       send("TASK_START", nextParsed);
       startedTaskUid = nextParsed.task_uid;
@@ -225,7 +232,7 @@
       if (Number.isFinite(nextParsed.preview_frame)) {
         emitFrameFromPreview(nextParsed.preview_frame);
       }
-    } else {
+    } else if (!isUnknown) {
       startTrackingForUrl(next);
     }
   }

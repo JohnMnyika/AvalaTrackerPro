@@ -29,6 +29,14 @@ from backend.schemas import (
 )
 from tracker.frame_tracker import calculate_frame_speed
 
+CAMERA_NORMALIZE_RE = re.compile(r'\s*\(CAM\s*\d+\)\s*$', re.IGNORECASE)
+
+def normalize_camera_name(camera_raw: str | None) -> str | None:
+    """Normalize camera names by removing (CAM XX) patterns."""
+    if not camera_raw:
+        return camera_raw
+    return CAMERA_NORMALIZE_RE.sub('', camera_raw.strip())
+
 router = APIRouter()
 
 session_manager = None
@@ -75,12 +83,16 @@ def health_check():
     return {"status": "ok", "service": "Avala Tracker Pro"}
 
 
-def _update_task_fields(task: Task, payload: TaskUpdateRequest | TaskStartRequest) -> bool:
+def _update_task_fields(task: Task, payload: TaskUpdateRequest | TaskStartRequest, normalized_camera: str | None = None) -> bool:
     changed = False
     if getattr(payload, "dataset", None) and task.dataset != payload.dataset:
         task.dataset = payload.dataset
         changed = True
-    if getattr(payload, "camera", None) and task.camera_name != payload.camera:
+    if normalized_camera is not None and task.camera_name != normalized_camera:
+        task.camera_name = normalized_camera
+        changed = True
+    elif getattr(payload, "camera", None) and normalized_camera is None and task.camera_name != payload.camera:
+        # Fallback for cases where normalized_camera isn't provided
         task.camera_name = payload.camera
         changed = True
     if getattr(payload, "frame_start", None) is not None and payload.frame_start > 0:
@@ -104,6 +116,13 @@ def _update_task_fields(task: Task, payload: TaskUpdateRequest | TaskStartReques
 
 @router.post("/task/start", response_model=SessionResponse)
 def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
+    # Normalize camera name
+    normalized_camera = normalize_camera_name(payload.camera)
+    
+    # Skip tracking unknown-dataset or unknown camera tasks
+    if payload.dataset == "unknown-dataset" or normalized_camera == "unknown":
+        return SessionResponse(session_id=0, task_uid=payload.task_uid, start_time=datetime.utcnow(), end_time=None, active_minutes=0, idle_minutes=0, frames_completed=0, efficiency_score=0)
+    
     if session_manager is None:
         raise HTTPException(status_code=500, detail="Session manager unavailable")
 
@@ -113,7 +132,7 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
             db.query(Task)
             .filter(
                 Task.dataset == payload.dataset,
-                Task.camera_name == payload.camera,
+                Task.camera_name == normalized_camera,
                 Task.created_at >= func.datetime("now", "-2 minutes"),
             )
             .order_by(Task.created_at.desc())
@@ -124,7 +143,7 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
         task = Task(
             task_uid=payload.task_uid,
             dataset=payload.dataset,
-            camera_name=payload.camera,
+            camera_name=normalized_camera,
             frame_start=payload.frame_start,
             frame_end=payload.frame_end,
             total_frames=payload.total_frames,
@@ -134,7 +153,7 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(task)
     else:
-        if _update_task_fields(task, payload):
+        if _update_task_fields(task, payload, normalized_camera):
             db.commit()
             db.refresh(task)
 
@@ -153,10 +172,17 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
 
 @router.post("/task/update", response_model=GenericResponse)
 def update_task(payload: TaskUpdateRequest, db: Session = Depends(get_db)):
+    # Normalize camera name
+    normalized_camera = normalize_camera_name(payload.camera)
+    
+    # Skip tracking unknown-dataset or unknown camera tasks
+    if payload.dataset == "unknown-dataset" or normalized_camera == "unknown":
+        return GenericResponse(status="ok", detail="Skipped (unknown dataset/camera)")
+    
     task = db.query(Task).filter(Task.task_uid == payload.task_uid).first()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
-    if _update_task_fields(task, payload):
+    if _update_task_fields(task, payload, normalized_camera):
         db.commit()
     return GenericResponse(status="ok", detail="Task updated")
 
@@ -186,6 +212,10 @@ def log_frame(payload: FrameLogRequest, db: Session = Depends(get_db)):
     task = db.query(Task).filter(Task.task_uid == payload.task_uid).first()
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
+    
+    # Skip logging frames for unknown-dataset or unknown camera tasks
+    if task.dataset == "unknown-dataset" or task.camera_name == "unknown":
+        return GenericResponse(status="ok", detail="Skipped (unknown dataset/camera)")
 
     frame_log = FrameLog(
         task_id=task.id,

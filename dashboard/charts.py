@@ -66,7 +66,7 @@ def heatmap_tasks(df: pd.DataFrame):
             colorbar=dict(title="Tasks"),
         )
     )
-    fig.update_layout(title="Productivity Heatmap (GitHub Style)", xaxis_title="ISO Week", yaxis_title="Day")
+    fig.update_layout(title="Productivity Heatmap", xaxis_title="ISO Week", yaxis_title="Day")
     return fig
 
 

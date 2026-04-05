@@ -105,6 +105,8 @@ streamlit run dashboard/dashboard.py
 python scripts/daily_report.py
 python scripts/weekly_summary.py
 python scripts/repair_task_counts.py
+python scripts/cleanup_unknown_entries.py
+python scripts/normalize_camera_names.py
 ```
 
 ## Security Notes
