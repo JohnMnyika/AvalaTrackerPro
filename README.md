@@ -8,6 +8,7 @@ A local productivity analytics platform for tracking annotation work on `avala.a
 - Activity and idle tracking (mouse/keyboard + extension pings)
 - Frame logging and session tracking
 - Analytics engine for efficiency and distributions
+- Payments and earnings sync support
 - Streamlit dashboard with Plotly graphs
 - Daily/weekly report scripts
 - Earnings estimation and productivity heatmap
@@ -46,6 +47,7 @@ avala-tracker-pro/
   scripts/
     daily_report.py
     weekly_summary.py
+    repair_task_counts.py
 ```
 
 ## Setup
@@ -79,10 +81,20 @@ streamlit run dashboard/dashboard.py
 4. Select the `extension/` folder
 
 ## API Endpoints
+- `GET /health`
 - `POST /task/start`
+- `POST /task/update`
 - `POST /task/end`
-- `POST /frame/log`
 - `POST /activity/ping`
+- `POST /frame/log`
+- `POST /contributions/sync`
+- `POST /extension/heartbeat`
+- `POST /payments/add-batch`
+- `POST /payments/add-history`
+- `POST /payments/debug`
+- `POST /payments/sync`
+- `GET /payments/summary`
+- `GET /payments/batches`
 - `GET /analytics/overview`
 - `GET /analytics/performance`
 - `GET /analytics/today`
@@ -92,6 +104,7 @@ streamlit run dashboard/dashboard.py
 ```bash
 python scripts/daily_report.py
 python scripts/weekly_summary.py
+python scripts/repair_task_counts.py
 ```
 
 ## Security Notes

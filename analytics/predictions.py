@@ -11,8 +11,9 @@ except Exception:  # pragma: no cover
     LinearRegression = None
 
 
-def productivity_trend_prediction(db: Session) -> dict:
-    sessions = db.query(WorkSession).filter(WorkSession.end_time.is_not(None)).all()
+def productivity_trend_prediction(db: Session, sessions: list[WorkSession] | None = None) -> dict:
+    sessions = sessions if sessions is not None else db.query(WorkSession).filter(WorkSession.end_time.is_not(None)).all()
+    sessions = [session for session in sessions if session.end_time is not None]
     if len(sessions) < 3:
         return {
             "status": "insufficient_data",

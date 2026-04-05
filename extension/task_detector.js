@@ -32,6 +32,20 @@
     }
   }
 
+  function isPaymentDashboardUrl(url) {
+    try {
+      const u = new URL(url);
+      const hostname = (u.hostname || "").toLowerCase();
+      const pathname = (u.pathname || "").toLowerCase();
+      if (hostname === "pay.avala.ai" || hostname.endsWith(".pay.avala.ai")) {
+        return pathname === "/dashboard" || pathname === "/dashboard/" || pathname.startsWith("/dashboard/");
+      }
+      return false;
+    } catch (_err) {
+      return false;
+    }
+  }
+
   function parseFrameRangeFromLoad(loadValue) {
     if (!loadValue) return null;
     const match = loadValue.match(/(\d+)\s*-\s*(\d+)/);
@@ -100,7 +114,6 @@
 
       const sequenceFromPath = parseSequenceFromPath(parts);
       const sequenceId = u.searchParams.get("sequence_id") || sequenceFromPath || null;
-
       const viewportCamera = parseCameraFromViewport(u.searchParams.get("canvas_viewport"));
       const cameraGuess = (u.searchParams.get("camera") || viewportCamera || "unknown").trim();
       const normalizedCamera = normalizeCameraName(cameraGuess) || cameraGuess;
@@ -112,8 +125,6 @@
 
       let frameStart = explicitStart;
       let frameEnd = explicitEnd;
-
-      // Highest priority: load=66-100
       if (loadRange) {
         frameStart = loadRange[0];
         frameEnd = loadRange[1];
@@ -127,11 +138,8 @@
       );
       const expectedHours = Number(u.searchParams.get("expected_hours") || 0);
 
-      // Stable fallback UID not affected by volatile query params.
       const stableFallbackKey = [dataset, sequenceId || "", normalizedCamera].filter(Boolean).join("|");
-      const fallbackUid = stableFallbackKey
-        ? `task-${stableHash(stableFallbackKey)}`
-        : `task-${stableHash(u.pathname)}`;
+      const fallbackUid = stableFallbackKey ? `task-${stableHash(stableFallbackKey)}` : `task-${stableHash(u.pathname)}`;
       const resolvedTaskUid = idFromQuery || idFromPath || fallbackUid;
 
       return {
@@ -184,7 +192,6 @@
       const nodes = document.querySelectorAll(selector);
       if (nodes && nodes.length) count += nodes.length;
     }
-
     return count > 0 ? count : null;
   }
 
@@ -207,7 +214,6 @@
     const elements = document.querySelectorAll("[title], [aria-label], [data-tooltip], rect");
     const days = [];
     const seen = new Set();
-
     for (const el of elements) {
       const candidates = [
         el.getAttribute && el.getAttribute("title"),
@@ -216,7 +222,6 @@
         el.dataset && el.dataset.tooltip,
         el.textContent
       ];
-
       for (const candidate of candidates) {
         const parsed = parseContributionLabel(candidate);
         if (!parsed) continue;
@@ -226,16 +231,332 @@
         days.push(parsed);
       }
     }
-
     return days;
+  }
+
+  function parseUsd(text) {
+    if (!text) return null;
+    const match = String(text).replace(/,/g, "").match(/\$\s*(\d+(?:\.\d+)?)/);
+    return match ? Number(match[1]) : null;
+  }
+
+  function parseKes(text) {
+    if (!text) return null;
+    const match = String(text).replace(/,/g, "").match(/KES\s*(\d+(?:\.\d+)?)/i);
+    return match ? Number(match[1]) : null;
+  }
+
+  function normalizeHistoryDate(text) {
+    if (!text) return null;
+    const match = String(text).trim().match(/^([A-Z][a-z]{2})\s+(\d{1,2}),\s*(\d{4})$/);
+    if (!match) return null;
+    const months = { Jan: '01', Feb: '02', Mar: '03', Apr: '04', May: '05', Jun: '06', Jul: '07', Aug: '08', Sep: '09', Oct: '10', Nov: '11', Dec: '12' };
+    const month = months[match[1]];
+    const day = String(match[2]).padStart(2, '0');
+    const year = match[3];
+    return month ? `${year}-${month}-${day}` : null;
+  }
+
+  const paymentSectionCache = {
+    recentWork: null,
+    paymentHistory: null
+  };
+
+  function normalizeText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function getPaymentDashboardRoot() {
+    return document.querySelector("main, [role='main'], [data-testid='dashboard-root']") || document.body;
+  }
+
+  function isConnectedElement(node) {
+    return Boolean(node && node.isConnected);
+  }
+
+  function resolveSectionContainer(node) {
+    if (!node) return null;
+    return (
+      node.closest("section, article, [role='region'], [class*='card'], [class*='panel'], [class*='section']") ||
+      node.parentElement ||
+      null
+    );
+  }
+
+  function findSectionRootByHeading(headingText) {
+    const cacheKey = headingText === "Recent Work Added" ? "recentWork" : "paymentHistory";
+    const cached = paymentSectionCache[cacheKey];
+    if (isConnectedElement(cached) && normalizeText(cached.textContent).includes(normalizeText(headingText))) {
+      return cached;
+    }
+
+    const root = getPaymentDashboardRoot();
+    const target = normalizeText(headingText);
+    const headingSelectors = [
+      "h1", "h2", "h3", "h4", "h5", "h6",
+      "[role='heading']",
+      "header *",
+      "[class*='title']",
+      "[class*='heading']",
+      "strong",
+      "span"
+    ].join(", ");
+
+    const candidates = Array.from(root.querySelectorAll(headingSelectors));
+    for (const node of candidates) {
+      const text = normalizeText(node.textContent);
+      if (!text || (!text.includes(target) && text !== target)) continue;
+      const container = resolveSectionContainer(node);
+      if (container) {
+        paymentSectionCache[cacheKey] = container;
+        return container;
+      }
+    }
+    return null;
+  }
+
+  function collectSectionItems(section) {
+    if (!section) return [];
+    const selectors = [
+      ":scope li",
+      ":scope tr",
+      ":scope [role='row']",
+      ":scope [data-testid*='row']",
+      ":scope [class*='row']",
+      ":scope [class*='item']",
+      ":scope article",
+      ":scope section > div"
+    ];
+    const seen = new Set();
+    const items = [];
+    for (const selector of selectors) {
+      for (const node of section.querySelectorAll(selector)) {
+        if (!isConnectedElement(node) || seen.has(node)) continue;
+        seen.add(node);
+        items.push(node);
+      }
+      if (items.length) break;
+    }
+    return items.length ? items : Array.from(section.children || []);
+  }
+
+  function extractPaymentSectionText(rawText, startHeading, endHeadings) {
+    const normalized = String(rawText || '').replace(/\s+/g, ' ').trim();
+    if (!normalized) return '';
+    const lower = normalized.toLowerCase();
+    const startIndex = lower.lastIndexOf(String(startHeading || '').toLowerCase());
+    let scoped = startIndex >= 0 ? normalized.slice(startIndex) : normalized;
+    const scopedLower = scoped.toLowerCase();
+    let endIndex = -1;
+    for (const heading of endHeadings || []) {
+      const idx = scopedLower.indexOf(String(heading || '').toLowerCase());
+      if (idx > 0 && (endIndex === -1 || idx < endIndex)) {
+        endIndex = idx;
+      }
+    }
+    if (endIndex > 0) {
+      scoped = scoped.slice(0, endIndex);
+    }
+    return scoped.trim();
+  }
+
+  function getPaymentTextCandidates() {
+    const root = getPaymentDashboardRoot();
+    const candidates = [
+      document.body && document.body.innerText,
+      root && root.innerText,
+      document.body && document.body.textContent,
+      root && root.textContent,
+    ];
+    const out = [];
+    const seen = new Set();
+    for (const value of candidates) {
+      const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      out.push(normalized);
+    }
+    return out;
+  }
+
+  function dedupeBy(rows, makeKey) {
+    const seen = new Set();
+    const deduped = [];
+    for (const row of rows || []) {
+      const key = makeKey(row);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      deduped.push(row);
+    }
+    return deduped;
+  }
+
+  function parseRecentWorkText(text) {
+    const scoped = extractPaymentSectionText(text, 'Recent Work Added', ['Payment History', 'Bonuses & Deductions']);
+    if (!scoped) return [];
+    const rows = [];
+    const pattern = /(batch-\d+(?:-[a-z0-9]+)+)(?:[A-Za-z]+)?[\s\S]{0,50}((?:about\s+\d+\s+(?:minutes?|hours?|days?))|(?:\d+\s+(?:minutes?|hours?|days?))|(?:about\s+1\s+month)|(?:\d+\s+months?)|(?:1\s+day))(?:\s+ago)?[\s\S]{0,50}?(\d+(?:\.\d{2}))/gi;
+    let match;
+    while ((match = pattern.exec(scoped)) !== null) {
+      const batchName = match[1];
+      const timestamp = match[2];
+      const amount = Number(match[3]);
+      if (!batchName || !Number.isFinite(amount)) continue;
+      rows.push({
+        batch_name: batchName,
+        amount_usd: amount,
+        timestamp,
+        source: 'recent_work'
+      });
+    }
+    return dedupeBy(rows, (row) => `${row.batch_name}|${row.amount_usd}`);
+  }
+
+  function parseRecentWorkItems(items) {
+    const combinedText = items
+      .map((item) => (item.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
+    return parseRecentWorkText(combinedText);
+  }
+
+  function parsePaymentHistoryText(text) {
+    const scoped = extractPaymentSectionText(text, 'Payment History', ['Bonuses & Deductions']);
+    if (!scoped) return [];
+    const rows = [];
+    const pattern = /([A-Z][a-z]{2}\s+\d{1,2},\s*\d{4})\s*(completed|pending|failed|processing)\s*\$(\d+(?:\.\d+)?)\s*(?:→\s*KES\s*([\d,]+(?:\.\d+)?))?/gi;
+    let match;
+    while ((match = pattern.exec(scoped)) !== null) {
+      const normalizedDate = normalizeHistoryDate(match[1]);
+      const amountUsd = Number(match[3]);
+      const amountKes = match[4] ? Number(String(match[4]).replace(/,/g, '')) : 0;
+      const status = (match[2] || 'completed').toLowerCase();
+      if (!normalizedDate || !Number.isFinite(amountUsd)) continue;
+      rows.push({
+        date: normalizedDate,
+        amount_usd: amountUsd,
+        amount_kes: Number.isFinite(amountKes) ? amountKes : 0,
+        status
+      });
+    }
+    return dedupeBy(rows, (row) => `${row.date}|${row.amount_usd}|${row.amount_kes}`);
+  }
+
+  function parsePaymentHistoryItems(items) {
+    const combinedText = items
+      .map((item) => (item.textContent || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean)
+      .join('\n');
+    return parsePaymentHistoryText(combinedText);
+  }
+
+  function collectPaymentFallbackItems() {
+    const root = getPaymentDashboardRoot();
+    return Array.from(root.querySelectorAll('li, tr, [role="row"], article, section, div'));
+  }
+
+  function extractRecentWorkFromDom() {
+    for (const candidate of getPaymentTextCandidates()) {
+      const rows = parseRecentWorkText(candidate);
+      if (rows.length) return rows;
+    }
+    const section = findSectionRootByHeading('Recent Work Added');
+    if (section) {
+      const sectionText = ((section.innerText || section.textContent) || '').replace(/\s+/g, ' ').trim();
+      const rowsFromText = parseRecentWorkText(sectionText);
+      if (rowsFromText.length) return rowsFromText;
+      const rowsFromItems = parseRecentWorkItems(collectSectionItems(section));
+      if (rowsFromItems.length) return rowsFromItems;
+    }
+    return [];
+  }
+
+  function extractPaymentHistoryFromDom() {
+    for (const candidate of getPaymentTextCandidates()) {
+      const rows = parsePaymentHistoryText(candidate);
+      if (rows.length) return rows;
+    }
+    const section = findSectionRootByHeading('Payment History');
+    if (section) {
+      const sectionText = ((section.innerText || section.textContent) || '').replace(/\s+/g, ' ').trim();
+      const rowsFromText = parsePaymentHistoryText(sectionText);
+      if (rowsFromText.length) return rowsFromText;
+      const rowsFromItems = parsePaymentHistoryItems(collectSectionItems(section));
+      if (rowsFromItems.length) return rowsFromItems;
+    }
+    return [];
+  }
+
+  function isPaymentMutationRelevant(target) {
+    if (!target || !(target instanceof Element)) return false;
+    const recentWorkSection = findSectionRootByHeading('Recent Work Added');
+    const paymentHistorySection = findSectionRootByHeading('Payment History');
+    if (
+      (recentWorkSection && (target === recentWorkSection || recentWorkSection.contains(target))) ||
+      (paymentHistorySection && (target === paymentHistorySection || paymentHistorySection.contains(target)))
+    ) {
+      return true;
+    }
+    const root = getPaymentDashboardRoot();
+    return Boolean(root && (target === root || root.contains(target)));
+  }
+
+  function buildPaymentFingerprint() {
+    const samples = getPaymentTextCandidates().slice(0, 3).map((value) => value.slice(0, 500));
+    return samples.join('\n---\n');
+  }
+
+  function inspectPaymentSections() {
+    const recentWorkSection = findSectionRootByHeading('Recent Work Added');
+    const paymentHistorySection = findSectionRootByHeading('Payment History');
+    const recentWork = extractRecentWorkFromDom();
+    const paymentHistory = extractPaymentHistoryFromDom();
+    return {
+      page_detected: isPaymentDashboardUrl(window.location.href),
+      page_url: window.location.href,
+      recent_work_section_found: Boolean(recentWorkSection) || recentWork.length > 0,
+      payment_history_section_found: Boolean(paymentHistorySection) || paymentHistory.length > 0,
+      recent_work_rows: recentWork.length,
+      payment_history_rows: paymentHistory.length,
+      page_fingerprint: buildPaymentFingerprint(),
+      recent_work: recentWork,
+      payment_history: paymentHistory
+    };
+  }
+
+  function extractPaymentsFromDom() {
+    const diagnostics = inspectPaymentSections();
+    return {
+      recent_work: diagnostics.recent_work,
+      payment_history: diagnostics.payment_history,
+      debug: {
+        page_detected: diagnostics.page_detected,
+        page_url: diagnostics.page_url,
+        recent_work_section_found: diagnostics.recent_work_section_found,
+        payment_history_section_found: diagnostics.payment_history_section_found,
+        recent_work_rows: diagnostics.recent_work_rows,
+        payment_history_rows: diagnostics.payment_history_rows,
+        page_fingerprint: diagnostics.page_fingerprint,
+        last_status:
+          diagnostics.recent_work_rows || diagnostics.payment_history_rows
+            ? "scraped_rows"
+            : (diagnostics.recent_work_section_found || diagnostics.payment_history_section_found)
+              ? "sections_found"
+              : "waiting_for_sync"
+      }
+    };
   }
 
   window.AvalaTaskDetector = {
     isTaskUrl,
     isProfileUrl,
+    isPaymentDashboardUrl,
     parseTaskFromUrl,
     extractFrameNumberFromDom,
     extractAnnotationCountFromDom,
-    extractContributionDaysFromDom
+    extractContributionDaysFromDom,
+    extractPaymentsFromDom,
+    inspectPaymentSections,
+    isPaymentMutationRelevant
   };
 })();

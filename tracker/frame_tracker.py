@@ -8,8 +8,8 @@ from sqlalchemy.orm import Session
 from backend.models import FrameLog, Task
 
 
-def calculate_frame_speed(db: Session) -> list[dict]:
-    logs = (
+def calculate_frame_speed(db: Session, joined_logs: list[tuple[FrameLog, Task]] | None = None) -> list[dict]:
+    logs = joined_logs if joined_logs is not None else (
         db.query(FrameLog, Task)
         .join(Task, Task.id == FrameLog.task_id)
         .order_by(FrameLog.timestamp.asc())

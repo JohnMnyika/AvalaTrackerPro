@@ -10,14 +10,14 @@ from backend.models import Session as WorkSession
 from backend.models import Task
 
 
-def build_heatmap_data(db: Session) -> list[dict]:
-    tasks = db.query(Task).all()
+def build_heatmap_data(db: Session, tasks: list[Task] | None = None) -> list[dict]:
+    tasks = tasks if tasks is not None else db.query(Task).all()
     counter = Counter(t.created_at.date().isoformat() for t in tasks)
     return [{"date": d, "tasks_completed": c} for d, c in sorted(counter.items())]
 
 
-def best_working_hours(db: Session) -> list[dict]:
-    sessions = db.query(WorkSession).filter(WorkSession.end_time.is_not(None)).all()
+def best_working_hours(db: Session, sessions: list[WorkSession] | None = None) -> list[dict]:
+    sessions = sessions if sessions is not None else db.query(WorkSession).filter(WorkSession.end_time.is_not(None)).all()
     hour_stats: dict[int, list[float]] = defaultdict(list)
     for s in sessions:
         if not s.start_time:
@@ -31,11 +31,17 @@ def best_working_hours(db: Session) -> list[dict]:
     return sorted(results, key=lambda x: x["avg_frames"], reverse=True)
 
 
-def build_period_summaries(db: Session) -> dict:
-    tasks = db.query(Task).all()
-    sessions = db.query(WorkSession).all()
-    logs = db.query(FrameLog).all()
-    contribution_days = db.query(ContributionDay).all()
+def build_period_summaries(
+    db: Session,
+    tasks: list[Task] | None = None,
+    sessions: list[WorkSession] | None = None,
+    logs: list[FrameLog] | None = None,
+    contribution_days: list[ContributionDay] | None = None,
+) -> dict:
+    tasks = tasks if tasks is not None else db.query(Task).all()
+    sessions = sessions if sessions is not None else db.query(WorkSession).all()
+    logs = logs if logs is not None else db.query(FrameLog).all()
+    contribution_days = contribution_days if contribution_days is not None else db.query(ContributionDay).all()
 
     weekly = defaultdict(lambda: {"tasks": 0, "frames": 0, "hours": 0.0, "boxes": 0, "expected": 0.0})
     monthly = defaultdict(lambda: {"tasks": 0, "frames": 0, "hours": 0.0, "boxes": 0, "expected": 0.0})
@@ -114,9 +120,13 @@ def build_period_summaries(db: Session) -> dict:
     return {"weekly": weekly_list, "monthly": monthly_list}
 
 
-def build_performance_insights(db: Session) -> dict:
-    tasks = db.query(Task).all()
-    sessions = db.query(WorkSession).all()
+def build_performance_insights(
+    db: Session,
+    tasks: list[Task] | None = None,
+    sessions: list[WorkSession] | None = None,
+) -> dict:
+    tasks = tasks if tasks is not None else db.query(Task).all()
+    sessions = sessions if sessions is not None else db.query(WorkSession).all()
 
     if not tasks:
         return {
@@ -168,7 +178,7 @@ def build_performance_insights(db: Session) -> dict:
     difficult = sorted(difficult, key=lambda x: x["frames_per_hour"])[:5]
 
     return {
-        "best_working_hours": best_working_hours(db)[:5],
+        "best_working_hours": best_working_hours(db, sessions=sessions)[:5],
         "slowest_tasks": slowest,
         "most_difficult_cameras": difficult,
         "generated_at": datetime.utcnow().isoformat(),

@@ -20,18 +20,22 @@ from analytics.metrics import compute_core_metrics
 from analytics.predictions import productivity_trend_prediction
 from analytics.productivity import build_heatmap_data, build_performance_insights, build_period_summaries
 from backend.database import SessionLocal, ensure_schema
-from backend.models import FrameLog
+from backend.models import ContributionDay, FrameLog
 from backend.models import Session as WorkSession
 from backend.models import Task
 from charts import (
+    bar_batch_profitability,
+    bar_camera_progress,
     bar_frames_per_hour,
     bar_period_metric,
     heatmap_tasks,
+    line_earnings_over_time,
     line_efficiency,
     line_frame_speed,
     line_period_metric,
     line_tasks_per_day,
     pie_distribution,
+    usd_kes_comparison,
 )
 from tracker.frame_tracker import calculate_frame_speed
 
@@ -46,6 +50,34 @@ def load_config() -> dict:
 
 def money(value: float) -> str:
     return f"${value:,.2f}"
+
+
+def status_tone(status: str | None) -> str:
+    mapping = {
+        "synced": "green",
+        "ok": "green",
+        "scraped_rows": "blue",
+        "sections_found": "orange",
+        "waiting_for_sync": "orange",
+        "backend_error": "orange",
+        "stale": "orange",
+    }
+    return mapping.get((status or "").lower(), "purple")
+
+
+def style_payment_status_table(df: pd.DataFrame):
+    if df.empty or "Status" not in df.columns:
+        return df
+
+    def highlight_status(value: object) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized == "paid":
+            return "background-color: rgba(34, 197, 94, 0.18); color: #bbf7d0; font-weight: 600;"
+        if normalized == "unpaid":
+            return "background-color: rgba(249, 115, 22, 0.18); color: #fed7aa; font-weight: 600;"
+        return ""
+
+    return df.style.map(highlight_status, subset=["Status"])
 
 
 def style_figure(fig, accent: str = "#b026ff"):
@@ -182,6 +214,105 @@ def build_batch_breakdown(task_rows: list[Task], session_rows: list[WorkSession]
     return pd.DataFrame(rows)
 
 
+@st.cache_data(ttl=5, show_spinner=False)
+def load_dashboard_snapshot() -> dict:
+    ensure_schema()
+    with SessionLocal() as db:
+        task_rows = db.query(Task).all()
+        session_rows = db.query(WorkSession).all()
+        frame_logs = db.query(FrameLog).all()
+        contribution_days = db.query(ContributionDay).all()
+        joined_frame_logs = (
+            db.query(FrameLog, Task)
+            .join(Task, Task.id == FrameLog.task_id)
+            .order_by(FrameLog.timestamp.asc())
+            .all()
+        )
+        task_map = {t.id: t for t in task_rows}
+
+        metrics = compute_core_metrics(db)
+        try:
+            insights = build_performance_insights(db, tasks=task_rows, sessions=session_rows)
+        except TypeError:
+            insights = build_performance_insights(db)
+        try:
+            heatmap_data = build_heatmap_data(db, tasks=task_rows)
+        except TypeError:
+            heatmap_data = build_heatmap_data(db)
+        try:
+            frame_speed = calculate_frame_speed(db, joined_logs=joined_frame_logs)
+        except TypeError:
+            frame_speed = calculate_frame_speed(db)
+        try:
+            prediction = productivity_trend_prediction(db, sessions=session_rows)
+        except TypeError:
+            prediction = productivity_trend_prediction(db)
+        try:
+            period_summaries = build_period_summaries(
+                db,
+                tasks=task_rows,
+                sessions=session_rows,
+                logs=frame_logs,
+                contribution_days=contribution_days,
+            )
+        except TypeError:
+            period_summaries = build_period_summaries(db)
+
+        speed_df = pd.DataFrame(frame_speed)
+        tasks_per_day = pd.DataFrame(heatmap_data)
+        batch_df = build_batch_breakdown(task_rows, session_rows, frame_logs)
+        camera_progress_df = pd.DataFrame()
+        if not batch_df.empty:
+            camera_progress_df = (
+                batch_df.groupby("Camera", as_index=False)
+                .agg({"Frames": "sum", "Boxes": "sum", "Hours": "sum"})
+                .sort_values(["Frames", "Boxes"], ascending=False)
+            )
+
+        efficiency_rows = []
+        for session in session_rows:
+            task = task_map.get(session.task_id)
+            if not task:
+                continue
+            actual_hours = (session.active_minutes + session.idle_minutes) / 60.0
+            efficiency_rows.append(
+                {
+                    "task_uid": task.task_uid,
+                    "expected_hours": task.expected_hours or 0,
+                    "actual_hours": round(actual_hours, 3),
+                }
+            )
+        efficiency_df = pd.DataFrame(efficiency_rows)
+
+        dataset_minutes = {}
+        for session in session_rows:
+            task = task_map.get(session.task_id)
+            if not task:
+                continue
+            dataset_minutes[task.dataset] = dataset_minutes.get(task.dataset, 0.0) + float(session.active_minutes or 0)
+
+        total_hours = sum((float(s.active_minutes or 0) + float(s.idle_minutes or 0)) for s in session_rows) / 60.0
+
+        return {
+            "metrics": metrics,
+            "insights": insights,
+            "heatmap_data": heatmap_data,
+            "frame_speed": frame_speed,
+            "prediction": prediction,
+            "period_summaries": period_summaries,
+            "speed_df": speed_df,
+            "tasks_per_day": tasks_per_day,
+            "batch_df": batch_df,
+            "camera_progress_df": camera_progress_df,
+            "efficiency_df": efficiency_df,
+            "dataset_minutes": {key: round(value / 60.0, 2) for key, value in dataset_minutes.items()},
+            "task_count": len(task_rows),
+            "session_count": len(session_rows),
+            "frame_log_count": len(frame_logs),
+            "total_hours": total_hours,
+        }
+
+
 def render_insights(insights: dict, prediction: dict, metrics: dict) -> None:
     insight_left, insight_right = st.columns([1.35, 1])
     with insight_left:
@@ -200,19 +331,19 @@ def render_insights(insights: dict, prediction: dict, metrics: dict) -> None:
         if best_hours_df.empty:
             st.info("Not enough completed sessions yet.")
         else:
-            st.dataframe(best_hours_df, use_container_width=True, hide_index=True)
+            st.dataframe(best_hours_df, width='stretch', hide_index=True)
 
         st.markdown("**Slowest Tasks**")
         if slowest_tasks_df.empty:
             st.info("No slow-task data yet.")
         else:
-            st.dataframe(slowest_tasks_df, use_container_width=True, hide_index=True)
+            st.dataframe(slowest_tasks_df, width='stretch', hide_index=True)
 
         st.markdown("**Most Difficult Cameras**")
         if difficult_cameras_df.empty:
             st.info("No camera difficulty data yet.")
         else:
-            st.dataframe(difficult_cameras_df, use_container_width=True, hide_index=True)
+            st.dataframe(difficult_cameras_df, width='stretch', hide_index=True)
 
     with insight_right:
         st.markdown("### AI Prediction")
@@ -230,7 +361,7 @@ def render_insights(insights: dict, prediction: dict, metrics: dict) -> None:
                 for key, value in prediction.items()
             ]
         )
-        st.dataframe(details_df, use_container_width=True, hide_index=True)
+        st.dataframe(details_df, width='stretch', hide_index=True)
 
         st.markdown("### Earnings Snapshot")
         earn1, earn2, earn3 = st.columns(3)
@@ -486,7 +617,7 @@ with nav_col:
                     unsafe_allow_html=True,
                 )
                 continue
-            if st.button(label, key=f"nav_{view}", use_container_width=True):
+            if st.button(label, key=f"nav_{view}", width='stretch'):
                 st.session_state.nav_view = view
 
 st.markdown(
@@ -503,135 +634,87 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-with SessionLocal() as db:
-    metrics = compute_core_metrics(db)
-    insights = build_performance_insights(db)
-    heatmap_data = build_heatmap_data(db)
-    frame_speed = calculate_frame_speed(db)
-    prediction = productivity_trend_prediction(db)
-    period_summaries = build_period_summaries(db)
+snapshot = load_dashboard_snapshot()
+metrics = snapshot["metrics"]
+insights = snapshot["insights"]
+heatmap_data = snapshot["heatmap_data"]
+frame_speed = snapshot["frame_speed"]
+prediction = snapshot["prediction"]
+period_summaries = snapshot["period_summaries"]
+payment_metrics = metrics.get("payments", {})
+earnings_over_time_df = pd.DataFrame(payment_metrics.get("earnings_per_day", []))
+earnings_per_batch_df = pd.DataFrame(payment_metrics.get("earnings_per_batch", []))
+profitability_per_hour_df = pd.DataFrame(payment_metrics.get("profitability_per_hour", []))
+top_paying_batches_df = pd.DataFrame(payment_metrics.get("top_paying_batches", []))
+best_paying_datasets_df = pd.DataFrame(payment_metrics.get("best_paying_datasets", []))
+usd_kes_df = pd.DataFrame(payment_metrics.get("usd_vs_kes", []))
+tracked_batches_df = pd.DataFrame(payment_metrics.get("tracked_batches", []))
+unpaid_batches_df = pd.DataFrame(payment_metrics.get("unpaid_batches", []))
+payment_sync_debug = payment_metrics.get("payment_sync_debug", {})
+extension_status = payment_metrics.get("extension_status", {})
 
-    task_rows = db.query(Task).all()
-    session_rows = db.query(WorkSession).all()
-    frame_logs = db.query(FrameLog).all()
-    task_map = {t.id: t for t in task_rows}
+speed_df = snapshot["speed_df"]
+tasks_per_day = snapshot["tasks_per_day"]
+batch_df = snapshot["batch_df"]
+camera_progress_df = snapshot["camera_progress_df"]
+efficiency_df = snapshot["efficiency_df"]
+dataset_minutes = snapshot["dataset_minutes"]
+task_count = int(snapshot["task_count"])
+session_count = int(snapshot["session_count"])
+frame_log_count = int(snapshot["frame_log_count"])
+total_hours = float(snapshot["total_hours"])
 
-    speed_df = pd.DataFrame(frame_speed)
-    tasks_per_day = pd.DataFrame(heatmap_data)
-    batch_df = build_batch_breakdown(task_rows, session_rows, frame_logs)
+total_earned = (total_hours * rate_per_hour) + (task_count * rate_per_task)
+current_balance = float(metrics["earnings"]["weekly"])
+paid_estimate = max(total_earned - current_balance, 0.0)
+hourly_yield = total_earned / total_hours if total_hours > 0 else 0.0
+next_expected = float(metrics["earnings"]["daily"])
 
-    efficiency_rows = []
-    for session in session_rows:
-        task = task_map.get(session.task_id)
-        if not task:
-            continue
-        actual_hours = (session.active_minutes + session.idle_minutes) / 60.0
-        efficiency_rows.append(
-            {
-                "task_uid": task.task_uid,
-                "expected_hours": task.expected_hours or 0,
-                "actual_hours": round(actual_hours, 3),
-            }
-        )
-    efficiency_df = pd.DataFrame(efficiency_rows)
-
-    total_hours = sum((s.active_minutes + s.idle_minutes) for s in session_rows) / 60.0
-    total_earned = (total_hours * rate_per_hour) + (len(task_rows) * rate_per_task)
-    current_balance = float(metrics["earnings"]["weekly"])
-    paid_estimate = max(total_earned - current_balance, 0.0)
-    hourly_yield = total_earned / total_hours if total_hours > 0 else 0.0
-    next_expected = float(metrics["earnings"]["daily"])
-
-    if current_view == "dashboard":
-        summary_left, summary_right = st.columns(2)
-        with summary_left:
-            st.markdown(
-                dedent(
-                    f"""
-                <div class="section-card">
-                  {card("Earnings", "Your earnings summary", "$", "purple")}
-                  <div class="stats-grid">
-                    <div>
-                      <div class="stat-kicker">Earned</div>
-                      <div class="stat-value">{money(total_earned)}</div>
-                    </div>
-                    <div>
-                      <div class="stat-kicker">Projected</div>
-                      <div class="stat-value green">{money(metrics['earnings']['monthly_projection'])}</div>
-                    </div>
-                    <div>
-                      <div class="stat-kicker">This Week</div>
-                      <div class="stat-value orange">{money(metrics['earnings']['weekly'])}</div>
-                    </div>
-                  </div>
-                </div>
-                """
-                ),
-                unsafe_allow_html=True,
-            )
-        with summary_right:
-            st.markdown(
-                dedent(
-                    f"""
-                <div class="section-card">
-                  {card("Performance", "Your work metrics", "▥", "blue")}
-                  <div class="stats-grid">
-                    <div>
-                      <div class="stat-kicker">Items</div>
-                      <div class="stat-value">{metrics['tasks_completed']}</div>
-                    </div>
-                    <div>
-                      <div class="stat-kicker">Hours</div>
-                      <div class="stat-value">{total_hours:.1f}</div>
-                    </div>
-                    <div>
-                      <div class="stat-kicker">$/Hour</div>
-                      <div class="stat-value">{money(hourly_yield) if hourly_yield else "—"}</div>
-                    </div>
-                  </div>
-                </div>
-                """
-                ),
-                unsafe_allow_html=True,
-            )
-
+if current_view == "dashboard":
+    summary_left, summary_right = st.columns(2)
+    with summary_left:
         st.markdown(
             dedent(
-                """
-            <div class="notice-card">
-              <div class="notice-title">Transaction fees covered</div>
-              <div class="notice-subtitle">This local dashboard mirrors the Avala Tracker feel while keeping your original analytics workflow intact.</div>
+                f"""
+            <div class="section-card">
+              {card("Earnings", "Your earnings summary", "$", "purple")}
+              <div class="stats-grid">
+                <div>
+                  <div class="stat-kicker">Earned</div>
+                  <div class="stat-value">{money(total_earned)}</div>
+                </div>
+                <div>
+                  <div class="stat-kicker">Projected</div>
+                  <div class="stat-value green">{money(metrics['earnings']['monthly_projection'])}</div>
+                </div>
+                <div>
+                  <div class="stat-kicker">This Week</div>
+                  <div class="stat-value orange">{money(metrics['earnings']['weekly'])}</div>
+                </div>
+              </div>
             </div>
             """
             ),
             unsafe_allow_html=True,
         )
-
+    with summary_right:
         st.markdown(
             dedent(
                 f"""
-            <div class="section-card" style="margin-top:1.1rem;">
-              {card("Analytics Timeline", "Track your work and payout momentum", "◴", "blue")}
-              <div class="timeline-grid">
+            <div class="section-card">
+              {card("Performance", "Your work metrics", "▥", "blue")}
+              <div class="stats-grid">
                 <div>
-                  <div class="timeline-label">Daily Earnings</div>
-                  <div class="timeline-value">{money(metrics['earnings']['daily'])}</div>
-                  <div class="timeline-note">Estimated from your configured rates</div>
+                  <div class="stat-kicker">Items</div>
+                  <div class="stat-value">{metrics['tasks_completed']}</div>
                 </div>
                 <div>
-                  <div class="timeline-label">Next Focus Metric</div>
-                  <div class="timeline-value">{next_expected:.2f}</div>
-                  <div class="timeline-note">Current daily earnings pace</div>
+                  <div class="stat-kicker">Hours</div>
+                  <div class="stat-value">{total_hours:.1f}</div>
                 </div>
                 <div>
-                  <div class="timeline-label">Tasks Completed Today</div>
-                  <div class="timeline-value">{metrics['tasks_completed_today']}</div>
-                  <div class="timeline-note">Frames today: {metrics['frames_annotated_today']}</div>
-                </div>
-                <div>
-                  <div class="timeline-label">Hours Worked Today</div>
-                  <div class="timeline-value">{metrics['hours_worked_today']:.2f}</div>
-                  <div class="timeline-note">Efficiency ratio: {metrics['efficiency_ratio']}</div>
+                  <div class="stat-kicker">$/Hour</div>
+                  <div class="stat-value">{money(hourly_yield) if hourly_yield else "—"}</div>
                 </div>
               </div>
             </div>
@@ -640,240 +723,485 @@ with SessionLocal() as db:
             unsafe_allow_html=True,
         )
 
-        quick1, quick2, quick3, quick4, quick5 = st.columns(5)
-        quick1.metric("Tasks Today", metrics["tasks_completed_today"])
-        quick2.metric("Frames Today", metrics["frames_annotated_today"])
-        quick3.metric("Boxes Today", metrics.get("boxes_annotated_today", 0))
-        quick4.metric("Hours Today", metrics["hours_worked_today"])
-        quick5.metric("Efficiency", metrics["efficiency_ratio"])
+    st.markdown(
+        dedent(
+            """
+        <div class="notice-card">
+          <div class="notice-title">Transaction fees covered</div>
+          <div class="notice-subtitle">This local dashboard mirrors the Avala Tracker feel while keeping your original analytics workflow intact.</div>
+        </div>
+        """
+        ),
+        unsafe_allow_html=True,
+    )
 
-        tabs = st.tabs(["Analytics", "Progress", "Insights"])
+    st.markdown(
+        dedent(
+            f"""
+        <div class="section-card" style="margin-top:1.1rem;">
+          {card("Analytics Timeline", "Track your work and payout momentum", "◴", "blue")}
+          <div class="timeline-grid">
+            <div>
+              <div class="timeline-label">Daily Earnings</div>
+              <div class="timeline-value">{money(metrics['earnings']['daily'])}</div>
+              <div class="timeline-note">Estimated from your configured rates</div>
+            </div>
+            <div>
+              <div class="timeline-label">Next Focus Metric</div>
+              <div class="timeline-value">{next_expected:.2f}</div>
+              <div class="timeline-note">Current daily earnings pace</div>
+            </div>
+            <div>
+              <div class="timeline-label">Tasks Completed Today</div>
+              <div class="timeline-value">{metrics['tasks_completed_today']}</div>
+              <div class="timeline-note">Frames today: {metrics['frames_annotated_today']}</div>
+            </div>
+            <div>
+              <div class="timeline-label">Hours Worked Today</div>
+              <div class="timeline-value">{metrics['hours_worked_today']:.2f}</div>
+              <div class="timeline-note">Efficiency ratio: {metrics['efficiency_ratio']}</div>
+            </div>
+          </div>
+        </div>
+        """
+        ),
+        unsafe_allow_html=True,
+    )
 
-        with tabs[0]:
-            left, right = st.columns(2)
-            with left:
-                st.plotly_chart(
-                    style_figure(bar_frames_per_hour(speed_df)),
-                    use_container_width=True,
-                    key="frames_per_hour_chart",
-                )
-            with right:
-                st.plotly_chart(
-                    style_figure(line_tasks_per_day(tasks_per_day), accent="#1f8cff"),
-                    use_container_width=True,
-                    key="tasks_per_day_chart",
-                )
+    quick1, quick2, quick3, quick4, quick5 = st.columns(5)
+    quick1.metric("Tasks Today", metrics["tasks_completed_today"])
+    quick2.metric("Frames Today", metrics["frames_annotated_today"])
+    quick3.metric("Boxes Today", metrics.get("boxes_annotated_today", 0))
+    quick4.metric("Hours Today", metrics["hours_worked_today"])
+    quick5.metric("Efficiency", metrics["efficiency_ratio"])
 
-            left, right = st.columns(2)
-            with left:
-                st.plotly_chart(
-                    style_figure(line_efficiency(efficiency_df)),
-                    use_container_width=True,
-                    key="efficiency_trends_chart",
-                )
-            with right:
-                st.plotly_chart(
-                    style_figure(pie_distribution(metrics["camera_distribution"], "Camera Distribution"), accent="#1f8cff"),
-                    use_container_width=True,
-                    key="camera_distribution_chart",
-                )
+    tabs = st.tabs(["Analytics", "Progress", "Insights"])
 
-            left, right = st.columns(2)
-            with left:
-                st.plotly_chart(
-                    style_figure(line_frame_speed(speed_df), accent="#00c16a"),
-                    use_container_width=True,
-                    key="frame_speed_chart",
-                )
-            with right:
-                if session_rows:
-                    dataset_minutes = {}
-                    for session in session_rows:
-                        task = task_map.get(session.task_id)
-                        if not task:
-                            continue
-                        dataset_minutes[task.dataset] = dataset_minutes.get(task.dataset, 0.0) + session.active_minutes
-                    st.plotly_chart(
-                        style_figure(
-                            pie_distribution(
-                                {key: round(value / 60.0, 2) for key, value in dataset_minutes.items()},
-                                "Hours Per Dataset",
-                            ),
-                            accent="#ff9800",
-                        ),
-                        use_container_width=True,
-                        key="dataset_hours_chart",
-                    )
-                else:
-                    st.info("No session data yet.")
-
+    with tabs[0]:
+        left, right = st.columns(2)
+        with left:
             st.plotly_chart(
-                style_figure(heatmap_tasks(tasks_per_day), accent="#b026ff"),
-                use_container_width=True,
-                key="productivity_heatmap_chart",
+                style_figure(bar_frames_per_hour(speed_df)),
+                width='stretch',
+                key="frames_per_hour_chart",
+            )
+        with right:
+            st.plotly_chart(
+                style_figure(line_tasks_per_day(tasks_per_day), accent="#1f8cff"),
+                width='stretch',
+                key="tasks_per_day_chart",
             )
 
-        with tabs[1]:
-            weekly_df = pd.DataFrame(period_summaries.get("weekly", []))
-            monthly_df = pd.DataFrame(period_summaries.get("monthly", []))
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(
+                style_figure(line_efficiency(efficiency_df)),
+                width='stretch',
+                key="efficiency_trends_chart",
+            )
+        with right:
+            st.plotly_chart(
+                style_figure(pie_distribution(metrics["camera_distribution"], "Camera Distribution"), accent="#1f8cff"),
+                width='stretch',
+                key="camera_distribution_chart",
+            )
 
-            st.markdown("### Weekly Progress")
-            if not weekly_df.empty:
-                left, right = st.columns(2)
-                with left:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(weekly_df, "period", "tasks_completed", "Tasks Completed Per Week")),
-                        use_container_width=True,
-                        key="weekly_tasks_chart",
-                    )
-                with right:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(weekly_df, "period", "frames_annotated", "Frames Annotated Per Week"), accent="#1f8cff"),
-                        use_container_width=True,
-                        key="weekly_frames_chart",
-                    )
-
-                left, right = st.columns(2)
-                with left:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(weekly_df, "period", "hours_worked", "Hours Worked Per Week"), accent="#00c16a"),
-                        use_container_width=True,
-                        key="weekly_hours_chart",
-                    )
-                with right:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(weekly_df, "period", "boxes_annotated", "Boxes Annotated Per Week"), accent="#ff9800"),
-                        use_container_width=True,
-                        key="weekly_boxes_chart",
-                    )
-
+        left, right = st.columns(2)
+        with left:
+            st.plotly_chart(
+                style_figure(line_frame_speed(speed_df), accent="#00c16a"),
+                width='stretch',
+                key="frame_speed_chart",
+            )
+        with right:
+            if dataset_minutes:
                 st.plotly_chart(
-                    style_figure(line_period_metric(weekly_df, "period", "efficiency_ratio", "Efficiency Ratio Per Week"), accent="#ff5f7a"),
-                    use_container_width=True,
-                    key="weekly_efficiency_chart",
-                )
-                st.dataframe(weekly_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No weekly data yet.")
-
-            st.markdown("### Monthly Progress")
-            if not monthly_df.empty:
-                left, right = st.columns(2)
-                with left:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(monthly_df, "period", "tasks_completed", "Tasks Completed Per Month")),
-                        use_container_width=True,
-                        key="monthly_tasks_chart",
-                    )
-                with right:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(monthly_df, "period", "frames_annotated", "Frames Annotated Per Month"), accent="#1f8cff"),
-                        use_container_width=True,
-                        key="monthly_frames_chart",
-                    )
-
-                left, right = st.columns(2)
-                with left:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(monthly_df, "period", "hours_worked", "Hours Worked Per Month"), accent="#00c16a"),
-                        use_container_width=True,
-                        key="monthly_hours_chart",
-                    )
-                with right:
-                    st.plotly_chart(
-                        style_figure(bar_period_metric(monthly_df, "period", "boxes_annotated", "Boxes Annotated Per Month"), accent="#ff9800"),
-                        use_container_width=True,
-                        key="monthly_boxes_chart",
-                    )
-
-                st.plotly_chart(
-                    style_figure(line_period_metric(monthly_df, "period", "efficiency_ratio", "Efficiency Ratio Per Month"), accent="#ff5f7a"),
-                    use_container_width=True,
-                    key="monthly_efficiency_chart",
-                )
-                st.dataframe(monthly_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No monthly data yet.")
-
-            st.markdown("### Rolling 7-Day Average")
-            if not tasks_per_day.empty:
-                rolling_df = tasks_per_day.copy()
-                rolling_df["date"] = pd.to_datetime(rolling_df["date"])
-                rolling_df = rolling_df.sort_values("date")
-                rolling_df["tasks_7d_avg"] = rolling_df["tasks_completed"].rolling(7, min_periods=1).mean()
-                st.plotly_chart(
-                    style_figure(line_period_metric(rolling_df, "date", "tasks_7d_avg", "7-Day Avg Tasks Completed"), accent="#7b61ff"),
-                    use_container_width=True,
-                    key="rolling_tasks_chart",
+                    style_figure(
+                        pie_distribution(dataset_minutes, "Hours Per Dataset"),
+                        accent="#ff9800",
+                    ),
+                    width='stretch',
+                    key="dataset_hours_chart",
                 )
             else:
-                st.info("No rolling task data yet.")
+                st.info("No session data yet.")
 
-        with tabs[2]:
-            render_insights(insights, prediction, metrics)
+        st.plotly_chart(
+            style_figure(heatmap_tasks(tasks_per_day), accent="#b026ff"),
+            width='stretch',
+            key="productivity_heatmap_chart",
+        )
 
-    elif current_view == "batches":
-        st.markdown("### Completed Batches")
-        if batch_df.empty:
-            st.info("No tracked batches yet. Start work in Avala and they will appear here.")
-        else:
-            top1, top2, top3, top4 = st.columns(4)
-            top1.metric("Batches Done", len(batch_df))
-            top2.metric("Frames Logged", int(batch_df["Frames"].sum()))
-            top3.metric("Boxes Added", int(batch_df["Boxes"].sum()))
-            top4.metric("Hours Spent", f"{batch_df['Hours'].sum():.2f}")
-            st.dataframe(batch_df, use_container_width=True, hide_index=True)
+    with tabs[1]:
+        weekly_df = pd.DataFrame(period_summaries.get("weekly", []))
+        monthly_df = pd.DataFrame(period_summaries.get("monthly", []))
 
-            st.markdown("### Batch Breakdown")
+        st.markdown("### Weekly Progress")
+        if not weekly_df.empty:
             left, right = st.columns(2)
             with left:
-                dataset_breakdown = (
-                    batch_df.groupby("Dataset", as_index=False)
-                    .agg({"Batch ID": "count", "Frames": "sum", "Hours": "sum"})
-                    .rename(columns={"Batch ID": "Batches"})
-                    .sort_values(["Batches", "Frames"], ascending=False)
+                st.plotly_chart(
+                    style_figure(bar_period_metric(weekly_df, "period", "tasks_completed", "Tasks Completed Per Week")),
+                    width='stretch',
+                    key="weekly_tasks_chart",
                 )
-                st.dataframe(dataset_breakdown, use_container_width=True, hide_index=True)
             with right:
-                camera_breakdown = (
-                    batch_df.groupby("Camera", as_index=False)
-                    .agg({"Batch ID": "count", "Frames": "sum", "Hours": "sum"})
-                    .rename(columns={"Batch ID": "Batches"})
-                    .sort_values(["Batches", "Frames"], ascending=False)
+                st.plotly_chart(
+                    style_figure(bar_period_metric(weekly_df, "period", "frames_annotated", "Frames Annotated Per Week"), accent="#1f8cff"),
+                    width='stretch',
+                    key="weekly_frames_chart",
                 )
-                st.dataframe(camera_breakdown, use_container_width=True, hide_index=True)
 
-    elif current_view == "payments":
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("Earned", money(total_earned))
-        p2.metric("Today", money(metrics["earnings"]["daily"]))
-        p3.metric("This Week", money(metrics["earnings"]["weekly"]))
-        p4.metric("Monthly Projection", money(metrics["earnings"]["monthly_projection"]))
-        payments_df = pd.DataFrame(
-            [
-                {"Window": "Daily", "Amount": metrics["earnings"]["daily"]},
-                {"Window": "Weekly", "Amount": metrics["earnings"]["weekly"]},
-                {"Window": "Monthly Projection", "Amount": metrics["earnings"]["monthly_projection"]},
-                {"Window": "Estimated Paid", "Amount": round(paid_estimate, 2)},
-            ]
-        )
-        st.dataframe(payments_df, use_container_width=True, hide_index=True)
+            left, right = st.columns(2)
+            with left:
+                st.plotly_chart(
+                    style_figure(bar_period_metric(weekly_df, "period", "hours_worked", "Hours Worked Per Week"), accent="#00c16a"),
+                    width='stretch',
+                    key="weekly_hours_chart",
+                )
+            with right:
+                st.plotly_chart(
+                    style_figure(bar_period_metric(weekly_df, "period", "boxes_annotated", "Boxes Annotated Per Week"), accent="#ff9800"),
+                    width='stretch',
+                    key="weekly_boxes_chart",
+                )
 
-    elif current_view == "quality":
+            st.plotly_chart(
+                style_figure(line_period_metric(weekly_df, "period", "efficiency_ratio", "Efficiency Ratio Per Week"), accent="#ff5f7a"),
+                width='stretch',
+                key="weekly_efficiency_chart",
+            )
+            st.dataframe(weekly_df, width='stretch', hide_index=True)
+        else:
+            st.info("No weekly data yet.")
+
+        st.markdown("### Monthly Progress")
+        if not monthly_df.empty:
+            left, right = st.columns(2)
+            with left:
+                st.plotly_chart(
+                    style_figure(bar_period_metric(monthly_df, "period", "tasks_completed", "Tasks Completed Per Month")),
+                    width='stretch',
+                    key="monthly_tasks_chart",
+                )
+            with right:
+                st.plotly_chart(
+                    style_figure(bar_period_metric(monthly_df, "period", "frames_annotated", "Frames Annotated Per Month"), accent="#1f8cff"),
+                    width='stretch',
+                    key="monthly_frames_chart",
+                )
+
+            left, right = st.columns(2)
+            with left:
+                st.plotly_chart(
+                    style_figure(bar_period_metric(monthly_df, "period", "hours_worked", "Hours Worked Per Month"), accent="#00c16a"),
+                    width='stretch',
+                    key="monthly_hours_chart",
+                )
+            with right:
+                st.plotly_chart(
+                    style_figure(bar_period_metric(monthly_df, "period", "boxes_annotated", "Boxes Annotated Per Month"), accent="#ff9800"),
+                    width='stretch',
+                    key="monthly_boxes_chart",
+                )
+
+            st.plotly_chart(
+                style_figure(line_period_metric(monthly_df, "period", "efficiency_ratio", "Efficiency Ratio Per Month"), accent="#ff5f7a"),
+                width='stretch',
+                key="monthly_efficiency_chart",
+            )
+            st.dataframe(monthly_df, width='stretch', hide_index=True)
+        else:
+            st.info("No monthly data yet.")
+
+        st.markdown("### Rolling 7-Day Average")
+        if not tasks_per_day.empty:
+            rolling_df = tasks_per_day.copy()
+            rolling_df["date"] = pd.to_datetime(rolling_df["date"])
+            rolling_df = rolling_df.sort_values("date")
+            rolling_df["tasks_7d_avg"] = rolling_df["tasks_completed"].rolling(7, min_periods=1).mean()
+            st.plotly_chart(
+                style_figure(line_period_metric(rolling_df, "date", "tasks_7d_avg", "7-Day Avg Tasks Completed"), accent="#7b61ff"),
+                width='stretch',
+                key="rolling_tasks_chart",
+            )
+        else:
+            st.info("No rolling task data yet.")
+
+        st.markdown("### Camera Progress")
+        if not camera_progress_df.empty:
+            st.plotly_chart(
+                style_figure(bar_camera_progress(camera_progress_df), accent="#1f8cff"),
+                width='stretch',
+                key="camera_progress_chart",
+            )
+            st.dataframe(camera_progress_df, width='stretch', hide_index=True)
+        else:
+            st.info("No camera progress data yet.")
+
+    with tabs[2]:
         render_insights(insights, prediction, metrics)
 
-    elif current_view == "profile":
-        profile1, profile2, profile3, profile4 = st.columns(4)
-        profile1.metric("Tracked Tasks", len(task_rows))
-        profile2.metric("Tracked Sessions", len(session_rows))
-        profile3.metric("Configured $/Hour", money(rate_per_hour))
-        profile4.metric("Configured $/Task", money(rate_per_task))
-        config_df = pd.DataFrame(
-            [{"Setting": key, "Value": stringify_value(value)} for key, value in config.items()]
+elif current_view == "batches":
+    st.markdown("### Completed Batches")
+    if batch_df.empty:
+        st.info("No tracked batches yet. Start work in Avala and they will appear here.")
+    else:
+        top1, top2, top3, top4 = st.columns(4)
+        top1.metric("Batches Done", len(batch_df))
+        top2.metric("Frames Logged", int(batch_df["Frames"].sum()))
+        top3.metric("Boxes Added", int(batch_df["Boxes"].sum()))
+        top4.metric("Hours Spent", f"{batch_df['Hours'].sum():.2f}")
+        st.dataframe(batch_df, width='stretch', hide_index=True)
+
+        st.markdown("### Batch Breakdown")
+        left, right = st.columns(2)
+        with left:
+            dataset_breakdown = (
+                batch_df.groupby("Dataset", as_index=False)
+                .agg({"Batch ID": "count", "Frames": "sum", "Hours": "sum"})
+                .rename(columns={"Batch ID": "Batches"})
+                .sort_values(["Batches", "Frames"], ascending=False)
+            )
+            st.dataframe(dataset_breakdown, width='stretch', hide_index=True)
+        with right:
+            camera_breakdown = (
+                batch_df.groupby("Camera", as_index=False)
+                .agg({"Batch ID": "count", "Frames": "sum", "Hours": "sum"})
+                .rename(columns={"Batch ID": "Batches"})
+                .sort_values(["Batches", "Frames"], ascending=False)
+            )
+            st.dataframe(camera_breakdown, width='stretch', hide_index=True)
+
+elif current_view == "payments":
+    current_month_usd = 0.0
+    if not earnings_over_time_df.empty:
+        earnings_over_time_df["date"] = pd.to_datetime(earnings_over_time_df["date"])
+        current_month = pd.Timestamp.now().strftime("%Y-%m")
+        current_month_usd = float(
+            earnings_over_time_df[
+                earnings_over_time_df["date"].dt.strftime("%Y-%m") == current_month
+            ]["amount_usd"].sum()
         )
-        st.dataframe(config_df, use_container_width=True, hide_index=True)
+
+    sync_status_value = str(payment_metrics.get("payment_sync_status", "waiting_for_sync")).replace("_", " ").title()
+    sync_tone = status_tone(payment_metrics.get("payment_sync_status"))
+    st.markdown(
+        dedent(
+            f"""
+        <div class="section-card" style="margin-bottom:1rem;">
+          {card("Payment Sync", f"Status: {sync_status_value}", "◎", sync_tone)}
+          <div class="stats-grid">
+            <div>
+              <div class="stat-kicker">Extension</div>
+              <div class="stat-value">{"Connected" if extension_status.get('connected') else "Offline"}</div>
+            </div>
+            <div>
+              <div class="stat-kicker">Recent Work Synced</div>
+              <div class="stat-value">{int(payment_metrics.get('recent_work_synced_count', 0))}</div>
+            </div>
+            <div>
+              <div class="stat-kicker">History Rows</div>
+              <div class="stat-value">{int(payment_metrics.get('payment_history_synced_count', 0))}</div>
+            </div>
+            <div>
+              <div class="stat-kicker">Last Batch Sync</div>
+              <div class="stat-value" style="font-size:1.15rem;">{payment_metrics.get('last_recent_work_sync_at', '—') or '—'}</div>
+            </div>
+          </div>
+        </div>
+        """
+        ),
+        unsafe_allow_html=True,
+    )
+    if payment_metrics.get("last_payment_history_date"):
+        st.caption(f"Latest payment history date: {payment_metrics['last_payment_history_date']}")
+    else:
+        st.caption("Open pay.avala.ai/dashboard and wait for the Recent Work Added and Payment History sections to render fully.")
+
+    has_payment_data = bool(
+        float(payment_metrics.get("total_earnings_usd", 0.0)) > 0
+        or int(payment_metrics.get("recent_work_synced_count", 0)) > 0
+        or int(payment_metrics.get("payment_history_synced_count", 0)) > 0
+    )
+
+    if not has_payment_data:
+        stage_label = str(payment_sync_debug.get("last_status") or "waiting_for_sync").replace("_", " ").title()
+        st.markdown(
+            dedent(
+                f"""
+            <div class="section-card" style="margin-bottom:1rem; border:1px solid rgba(255,255,255,0.08);">
+              <div style="display:flex; justify-content:space-between; gap:1rem; align-items:flex-start; flex-wrap:wrap;">
+                <div>
+                  <div class="summary-title" style="margin-bottom:0.35rem;">Payment Sync Setup</div>
+                  <div class="summary-subtitle">The tracker has not captured payment rows yet. Use the checklist below, then refresh this page.</div>
+                </div>
+                <div class="summary-subtitle" style="font-weight:700; color:#cdd6ea;">Stage: {stage_label}</div>
+              </div>
+              <div class="timeline-grid" style="margin-top:1rem;">
+                <div>
+                  <div class="timeline-label">1. Reload Extension</div>
+                  <div class="timeline-note">Open chrome://extensions and click Reload on Avala Tracker Pro.</div>
+                </div>
+                <div>
+                  <div class="timeline-label">2. Open Pay Dashboard</div>
+                  <div class="timeline-note">Visit pay.avala.ai/dashboard and keep it open for a few seconds.</div>
+                </div>
+                <div>
+                  <div class="timeline-label">3. Confirm Page Detection</div>
+                  <div class="timeline-note">The debug panel below should switch Pay Page Detected to Yes.</div>
+                </div>
+                <div>
+                  <div class="timeline-label">4. Refresh Tracker</div>
+                  <div class="timeline-note">Refresh Streamlit after the payment rows appear in the debug counters.</div>
+                </div>
+              </div>
+            </div>
+            """
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("Payment Sync Debug", expanded=not has_payment_data):
+        debug1, debug2, debug3, debug4 = st.columns(4)
+        debug1.metric("Extension", "Connected" if extension_status.get("connected") else "Offline")
+        debug2.metric("Pay Page Detected", "Yes" if payment_sync_debug.get("page_detected") else "No")
+        debug3.metric("Recent Work Section", "Found" if payment_sync_debug.get("recent_work_section_found") else "Missing")
+        debug4.metric("Payment History Section", "Found" if payment_sync_debug.get("payment_history_section_found") else "Missing")
+        debug_meta_df = pd.DataFrame([
+            {
+                "Extension Page Type": extension_status.get("page_type") or "—",
+                "Extension Last Seen": extension_status.get("last_seen_at") or "—",
+                "Backend Status": str(payment_sync_debug.get("backend_status_code") or "—"),
+            }
+        ])
+        st.dataframe(debug_meta_df, width='stretch', hide_index=True)
+        debug_df = pd.DataFrame([
+            {
+                "Last Stage": str(payment_sync_debug.get("last_status") or "waiting_for_sync").replace("_", " ").title(),
+                "Recent Work Rows": int(payment_sync_debug.get("recent_work_rows") or 0),
+                "Payment History Rows": int(payment_sync_debug.get("payment_history_rows") or 0),
+                "Last Attempt": payment_sync_debug.get("last_attempt_at") or "—",
+                "Last Success": payment_sync_debug.get("last_success_at") or "—",
+                "Last Error": payment_sync_debug.get("last_error") or "",
+                "Page URL": payment_sync_debug.get("page_url") or "",
+            }
+        ])
+        st.dataframe(debug_df, width='stretch', hide_index=True)
+        if payment_sync_debug.get("page_fingerprint"):
+            st.code(payment_sync_debug.get("page_fingerprint"), language="json")
+
+    p1, p2, p3, p4 = st.columns(4)
+    p1.metric("This Month", money(current_month_usd))
+    p2.metric("Total Earnings", money(float(payment_metrics.get("total_earnings_usd", 0.0))))
+    p3.metric("Avg / Task", money(float(payment_metrics.get("average_earning_per_task", 0.0))))
+    p4.metric("Earnings / Hour", money(float(payment_metrics.get("earnings_per_hour", 0.0))))
+
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(
+            style_figure(line_earnings_over_time(earnings_over_time_df), accent="#00c16a"),
+            width='stretch',
+            key="earnings_over_time_chart",
+        )
+    with right:
+        st.plotly_chart(
+            style_figure(bar_batch_profitability(earnings_per_batch_df), accent="#ff9800"),
+            width='stretch',
+            key="batch_profitability_chart",
+        )
+
+    left, right = st.columns(2)
+    with left:
+        st.plotly_chart(
+            style_figure(usd_kes_comparison(usd_kes_df), accent="#1f8cff"),
+            width='stretch',
+            key="usd_kes_chart",
+        )
+    with right:
+        st.markdown("### Top Paying Batches")
+        if top_paying_batches_df.empty:
+            st.info("Open pay.avala.ai/dashboard to sync payment data.")
+        else:
+            st.dataframe(top_paying_batches_df.head(5), width='stretch', hide_index=True)
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("### Profitability Per Hour")
+        if profitability_per_hour_df.empty:
+            st.info("Profitability will appear after batch payments and tracked hours overlap.")
+        else:
+            st.dataframe(profitability_per_hour_df, width='stretch', hide_index=True)
+    with right:
+        st.markdown("### Best Paying Datasets")
+        if best_paying_datasets_df.empty:
+            st.info("Dataset profitability will appear once payments match tracked work.")
+        else:
+            st.dataframe(best_paying_datasets_df, width='stretch', hide_index=True)
+
+    st.markdown("### Tracked Batch Payment Status")
+    if tracked_batches_df.empty:
+        st.info("Tracked batches will appear here after you work on Avala tasks.")
+    else:
+        status_filter = st.segmented_control(
+            "Batch Status Filter",
+            options=["All", "Paid", "Unpaid"],
+            default="All",
+            key="tracked_batch_status_filter",
+        )
+        tracked_display_df = tracked_batches_df.rename(
+            columns={
+                "batch_name": "Batch",
+                "payment_status": "Status",
+                "task_count": "Tasks",
+                "frames_logged": "Frames",
+                "hours_spent": "Hours",
+                "amount_usd": "Paid USD",
+                "paid_entries": "Payment Entries",
+                "last_tracked_at": "Last Tracked",
+            }
+        )
+        if status_filter and status_filter != "All":
+            tracked_display_df = tracked_display_df[tracked_display_df["Status"] == status_filter]
+        st.dataframe(style_payment_status_table(tracked_display_df), width='stretch', hide_index=True)
+
+    st.markdown("### Unpaid Tracked Batches")
+    unpaid1, unpaid2, unpaid3 = st.columns(3)
+    unpaid1.metric("Unpaid Batches", int(payment_metrics.get("unpaid_batch_count", 0)))
+    unpaid2.metric("Unpaid Frames", int(payment_metrics.get("unpaid_frames_total", 0)))
+    unpaid3.metric("Unpaid Hours", float(payment_metrics.get("unpaid_hours_total", 0.0)))
+    if unpaid_batches_df.empty:
+        st.success("Every tracked batch currently has a matching synced payment batch, or payments have not been synced yet.")
+    else:
+        unpaid_display_df = unpaid_batches_df.rename(
+            columns={
+                "batch_name": "Batch",
+                "payment_status": "Status",
+                "task_count": "Tasks",
+                "frames_logged": "Frames",
+                "hours_spent": "Hours",
+                "amount_usd": "Paid USD",
+                "paid_entries": "Payment Entries",
+                "last_tracked_at": "Last Tracked",
+            }
+        )
+        st.dataframe(style_payment_status_table(unpaid_display_df), width='stretch', hide_index=True)
+
+elif current_view == "quality":
+    render_insights(insights, prediction, metrics)
+
+elif current_view == "profile":
+    profile1, profile2, profile3, profile4 = st.columns(4)
+    profile1.metric("Tracked Tasks", task_count)
+    profile2.metric("Tracked Sessions", session_count)
+    profile3.metric("Configured $/Hour", money(rate_per_hour))
+    profile4.metric("Configured $/Task", money(rate_per_task))
+    config_df = pd.DataFrame(
+        [{"Setting": key, "Value": stringify_value(value)} for key, value in config.items()]
+    )
+    st.dataframe(config_df, width='stretch', hide_index=True)
 
 st.markdown(
-    "<div class='footer-note'>Runs fully local. Collects analytics only. Does not automate annotation.</div>",
-    unsafe_allow_html=True,
+"<div class='footer-note'>Runs fully local. Collects analytics only. Does not automate annotation.</div>",
+unsafe_allow_html=True,
 )

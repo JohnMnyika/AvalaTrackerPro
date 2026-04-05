@@ -62,3 +62,52 @@ class ContributionDay(Base):
     boxes_count = Column(Integer, default=0, nullable=False)
     source = Column(String, default="profile", nullable=False)
     captured_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class PaymentBatch(Base):
+    __tablename__ = "payments_batches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    batch_name = Column(String, unique=True, index=True, nullable=False)
+    amount_usd = Column(Float, nullable=False, default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class PaymentHistory(Base):
+    __tablename__ = "payments_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    date = Column(Date, index=True, nullable=False)
+    amount_usd = Column(Float, nullable=False, default=0.0)
+    amount_kes = Column(Float, nullable=True, default=0.0)
+    status = Column(String, nullable=False, default="completed")
+
+
+class PaymentSyncDebug(Base):
+    __tablename__ = "payments_sync_debug"
+
+    id = Column(Integer, primary_key=True, index=True)
+    sync_key = Column(String, unique=True, index=True, nullable=False, default="payments_dashboard")
+    page_url = Column(String, nullable=True)
+    page_detected = Column(Integer, nullable=False, default=0)
+    recent_work_section_found = Column(Integer, nullable=False, default=0)
+    payment_history_section_found = Column(Integer, nullable=False, default=0)
+    recent_work_rows = Column(Integer, nullable=False, default=0)
+    payment_history_rows = Column(Integer, nullable=False, default=0)
+    last_status = Column(String, nullable=False, default="waiting_for_sync")
+    last_error = Column(String, nullable=True)
+    backend_status_code = Column(Integer, nullable=True)
+    page_fingerprint = Column(String, nullable=True)
+    last_attempt_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    last_success_at = Column(DateTime, nullable=True)
+
+
+class ExtensionHeartbeat(Base):
+    __tablename__ = "extension_heartbeats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    client_key = Column(String, unique=True, index=True, nullable=False, default="primary")
+    page_url = Column(String, nullable=True)
+    page_type = Column(String, nullable=False, default="unknown")
+    source = Column(String, nullable=False, default="content_script")
+    last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)

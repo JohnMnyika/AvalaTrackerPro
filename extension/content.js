@@ -9,6 +9,22 @@
   let lastAnnotationCount = null;
   let lastFrameChangeTs = 0;
   let lastContributionSyncHash = null;
+  let lastPaymentsSyncHash = null;
+  let paymentSyncTimer = null;
+
+  const isTaskPage = () => detector.isTaskUrl(window.location.href);
+  const isProfilePage = () => detector.isProfileUrl(window.location.href);
+  const isPaymentPage = () => detector.isPaymentDashboardUrl(window.location.href);
+
+  async function postDirect(path, payload) {
+    try {
+      await fetch(`http://localhost:8000${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (_err) {}
+  }
 
   function send(type, payload) {
     try {
@@ -44,14 +60,64 @@
     send("TASK_UPDATE", update);
   }
 
+  function currentPageType() {
+    if (isPaymentPage()) return "payments";
+    if (isTaskPage()) return "task";
+    if (isProfilePage()) return "profile";
+    return "other";
+  }
+
+  function sendExtensionHeartbeat() {
+    const payload = {
+      client_key: "primary",
+      page_url: window.location.href,
+      page_type: currentPageType(),
+      source: "content_script"
+    };
+    send("EXTENSION_HEARTBEAT", payload);
+    postDirect("/extension/heartbeat", payload);
+  }
+
   function syncContributionDays() {
-    if (!detector.isProfileUrl(window.location.href)) return;
+    if (!isProfilePage()) return;
     const days = detector.extractContributionDaysFromDom();
     if (!days || !days.length) return;
     const nextHash = JSON.stringify(days);
     if (nextHash === lastContributionSyncHash) return;
     lastContributionSyncHash = nextHash;
     send("CONTRIBUTIONS_SYNC", { days });
+  }
+
+  function syncPayments() {
+    if (!isPaymentPage()) return;
+    const payload = detector.extractPaymentsFromDom();
+    if (!payload) return;
+    const recentWork = Array.isArray(payload.recent_work) ? payload.recent_work : [];
+    const paymentHistory = Array.isArray(payload.payment_history) ? payload.payment_history : [];
+    const debug = payload.debug || {
+      page_detected: true,
+      page_url: window.location.href,
+      recent_work_section_found: false,
+      payment_history_section_found: false,
+      recent_work_rows: recentWork.length,
+      payment_history_rows: paymentHistory.length,
+      last_status: "waiting_for_sync"
+    };
+    const nextHash = JSON.stringify({ recentWork, paymentHistory, debug });
+    if (nextHash === lastPaymentsSyncHash) return;
+    lastPaymentsSyncHash = nextHash;
+    send("PAYMENTS_SYNC", { recent_work: recentWork, payment_history: paymentHistory, debug });
+  }
+
+  function schedulePaymentsSync(delay = 250) {
+    if (!isPaymentPage()) return;
+    if (paymentSyncTimer) {
+      clearTimeout(paymentSyncTimer);
+    }
+    paymentSyncTimer = window.setTimeout(() => {
+      paymentSyncTimer = null;
+      syncPayments();
+    }, delay);
   }
 
   const emitFrameIfChanged = () => {
@@ -228,107 +294,12 @@
   }
 
   function injectNetworkHook() {
-    const hook = function () {
-      const MAX_DEPTH = 4;
-      const MAX_ARRAY = 50;
-
-      function extractSignals(obj, depth, out) {
-        if (!obj || depth > MAX_DEPTH) return;
-        if (Array.isArray(obj)) {
-          if (obj.length && typeof obj[0] === "object") {
-            for (let i = 0; i < Math.min(obj.length, MAX_ARRAY); i += 1) {
-              extractSignals(obj[i], depth + 1, out);
-            }
-          }
-          return;
-        }
-        if (typeof obj !== "object") return;
-
-        for (const key of Object.keys(obj)) {
-          const val = obj[key];
-          const lower = key.toLowerCase();
-
-          if (val && typeof val === "string") {
-            if (["work_unit_uid", "task_uid", "taskid", "task_id"].includes(lower)) out.task_uid = val;
-            if (["sequence_id", "sequenceid"].includes(lower)) out.sequence_id = val;
-            if (["dataset"].includes(lower)) out.dataset = val;
-            if (["camera", "camera_name", "cameraname"].includes(lower)) out.camera = val;
-          }
-
-          if (typeof val === "number") {
-            if (["frame", "frame_number", "framenumber", "frame_index", "frameindex"].includes(lower)) {
-              out.frame_number = val;
-            }
-          }
-
-          if (Array.isArray(val)) {
-            if (["annotations", "cuboids", "boxes", "objects", "labels", "annotations3d", "cuboidannotations"].includes(lower)) {
-              out.boxes_count = val.length;
-            }
-          }
-
-          if (val && typeof val === "object") {
-            extractSignals(val, depth + 1, out);
-          }
-        }
-      }
-
-      function shouldMarkComplete(url) {
-        if (!url) return false;
-        return /save|submit|complete|annotation|label/i.test(url);
-      }
-
-      const originalFetch = window.fetch;
-      window.fetch = async function (...args) {
-        const res = await originalFetch.apply(this, args);
-        try {
-          const url = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || res.url || "";
-          const ct = (res.headers.get("content-type") || "").toLowerCase();
-          if (ct.includes("application/json")) {
-            const clone = res.clone();
-            const data = await clone.json();
-            const out = {};
-            extractSignals(data, 0, out);
-            if (shouldMarkComplete(url)) out.frame_completed = true;
-            if (Object.keys(out).length) {
-              window.postMessage({ source: "avala-tracker-pro", type: "network", url, data: out }, "*");
-            }
-          }
-        } catch (_err) {}
-        return res;
-      };
-
-      const OriginalXHR = window.XMLHttpRequest;
-      function XHRProxy() {
-        const xhr = new OriginalXHR();
-        let url = "";
-        xhr.open = function (method, openUrl, ...rest) {
-          url = openUrl || "";
-          return OriginalXHR.prototype.open.call(this, method, openUrl, ...rest);
-        };
-        xhr.addEventListener("load", function () {
-          try {
-            const text = xhr.responseText || "";
-            if (!text || (text[0] !== "{" && text[0] !== "[")) return;
-            const data = JSON.parse(text);
-            const out = {};
-            extractSignals(data, 0, out);
-            if (shouldMarkComplete(url)) out.frame_completed = true;
-            if (Object.keys(out).length) {
-              window.postMessage({ source: "avala-tracker-pro", type: "network", url, data: out }, "*");
-            }
-          } catch (_err) {}
-        });
-        return xhr;
-      }
-      XHRProxy.prototype = OriginalXHR.prototype;
-      window.XMLHttpRequest = XHRProxy;
-    };
-
+    if (document.getElementById("avala-tracker-bridge")) return;
     const script = document.createElement("script");
-    script.textContent = `(${hook.toString()})();`;
-    document.documentElement.appendChild(script);
-    script.remove();
+    script.id = "avala-tracker-bridge";
+    script.src = chrome.runtime.getURL("page_bridge.js");
+    script.onload = () => script.remove();
+    (document.head || document.documentElement).appendChild(script);
   }
 
   window.addEventListener("message", (event) => {
@@ -430,16 +401,31 @@
   startTrackingForUrl(currentUrl);
   injectNetworkHook();
 
-  const observer = new MutationObserver(() => {
+  const observer = new MutationObserver((mutations) => {
     handleUrlChange();
-    emitFrameIfChanged();
-    emitAnnotationDelta();
-    syncContributionDays();
+    if (isTaskPage()) {
+      emitFrameIfChanged();
+      emitAnnotationDelta();
+    }
+    if (isProfilePage()) {
+      syncContributionDays();
+    }
+    if (isPaymentPage()) {
+      const shouldSyncPayments = mutations.some((mutation) => {
+        if (detector.isPaymentMutationRelevant(mutation.target)) return true;
+        return Array.from(mutation.addedNodes || []).some(
+          (node) => node instanceof Element && detector.isPaymentMutationRelevant(node)
+        );
+      });
+      if (shouldSyncPayments) {
+        schedulePaymentsSync(100);
+      }
+    }
   });
   observer.observe(document.documentElement, {
     childList: true,
     subtree: true,
-    attributes: true
+    characterData: true
   });
 
   document.addEventListener("mousemove", () => send("ACTIVITY_PING", { active: true }), { passive: true });
@@ -451,11 +437,28 @@
     }
   });
 
+  window.addEventListener("load", () => {
+    sendExtensionHeartbeat();
+    schedulePaymentsSync(0);
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      sendExtensionHeartbeat();
+      schedulePaymentsSync(0);
+    }
+  });
+
   setInterval(handleUrlChange, 1000);
+  setInterval(sendExtensionHeartbeat, 30000);
   setInterval(() => send("ACTIVITY_PING", { active: true }), 45000);
-  setInterval(emitFrameIfChanged, 3000);
-  setInterval(emitAnnotationDelta, 2000);
-  setInterval(pollGlobalStore, 3000);
-  setInterval(syncContributionDays, 4000);
+  setInterval(() => { if (isTaskPage()) emitFrameIfChanged(); }, 3000);
+  setInterval(() => { if (isTaskPage()) emitAnnotationDelta(); }, 2000);
+  setInterval(() => { if (isTaskPage()) pollGlobalStore(); }, 3000);
+  setInterval(() => { if (isProfilePage()) syncContributionDays(); }, 4000);
+  setInterval(() => { if (isPaymentPage()) syncPayments(); }, 2000);
+  sendExtensionHeartbeat();
   syncContributionDays();
+  schedulePaymentsSync(0);
+  setTimeout(() => schedulePaymentsSync(500), 500);
+  setTimeout(() => schedulePaymentsSync(1500), 1500);
 })();

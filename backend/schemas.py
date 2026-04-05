@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, Field
@@ -68,3 +68,43 @@ class ContributionDayPayload(BaseModel):
 
 class ContributionSyncRequest(BaseModel):
     days: List[ContributionDayPayload] = Field(default_factory=list)
+
+
+class PaymentBatchRequest(BaseModel):
+    batch_name: str = Field(..., min_length=3)
+    amount_usd: float = 0.0
+    source: str = "recent_work"
+    timestamp: Optional[str] = None
+
+
+class PaymentHistoryRequest(BaseModel):
+    date: date
+    amount_usd: float = 0.0
+    amount_kes: Optional[float] = 0.0
+    status: str = "completed"
+
+
+class PaymentSyncRequest(BaseModel):
+    recent_work: List[PaymentBatchRequest] = Field(default_factory=list)
+    payment_history: List[PaymentHistoryRequest] = Field(default_factory=list)
+
+
+class PaymentSyncDebugRequest(BaseModel):
+    sync_key: str = "payments_dashboard"
+    page_url: Optional[str] = None
+    page_detected: bool = False
+    recent_work_section_found: bool = False
+    payment_history_section_found: bool = False
+    recent_work_rows: int = 0
+    payment_history_rows: int = 0
+    last_status: str = "waiting_for_sync"
+    last_error: Optional[str] = None
+    backend_status_code: Optional[int] = None
+    page_fingerprint: Optional[str] = None
+
+
+class ExtensionHeartbeatRequest(BaseModel):
+    client_key: str = "primary"
+    page_url: Optional[str] = None
+    page_type: str = "unknown"
+    source: str = "content_script"
