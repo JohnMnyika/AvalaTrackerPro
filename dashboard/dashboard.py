@@ -37,6 +37,7 @@ from charts import (
     pie_distribution,
     usd_kes_comparison,
 )
+from audit_dashboard import display_audit_dashboard
 from tracker.frame_tracker import calculate_frame_speed
 
 CONFIG_PATH = PROJECT_ROOT / "config" / "settings.json"
@@ -152,7 +153,7 @@ def header_button(label: str, view: str, current_view: str) -> str:
 
 
 def normalize_view(value: str | None) -> str:
-    allowed = {"dashboard", "batches", "payments", "quality", "profile"}
+    allowed = {"dashboard", "batches", "payments", "quality", "profile", "audit"}
     return value if value in allowed else "dashboard"
 
 
@@ -607,6 +608,7 @@ with nav_col:
         ("Payments", "payments"),
         ("Quality", "quality"),
         ("Profile", "profile"),
+        ("Audit", "audit"),
     ]
     nav_cols = st.columns(len(nav_specs))
     for idx, (label, view) in enumerate(nav_specs):
@@ -1200,6 +1202,69 @@ elif current_view == "profile":
         [{"Setting": key, "Value": stringify_value(value)} for key, value in config.items()]
     )
     st.dataframe(config_df, width='stretch', hide_index=True)
+
+elif current_view == "audit":
+    st.markdown("## Payment Audit & Reconciliation System")
+    st.markdown("""
+    This section monitors duplicate payment entries, logs all changes to the audit trail, 
+    and manages reconciliation of conflicting payments.
+    
+    **Features:**
+    - 🔍 Automated duplicate detection
+    - 📝 Complete audit trail of all changes
+    - 🚩 Flagging system for payments with updated values
+    - ⚙️ Reconciliation workflow for duplicate resolution
+    """)
+    
+    st.divider()
+    
+    try:
+        import urllib.request
+        import urllib.error
+
+        api_base = "http://localhost:8000"
+
+        def fetch_json(method: str, url: str, data=None):
+            request = urllib.request.Request(url, method=method)
+            if data is not None:
+                request.add_header("Content-Type", "application/json")
+                request.data = json.dumps(data).encode("utf-8")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        try:
+            st.session_state.api_response_stats = fetch_json("GET", f"{api_base}/payments/audit-stats")
+        except Exception:
+            st.session_state.api_response_stats = None
+
+        try:
+            st.session_state.api_response_duplicates = fetch_json("POST", f"{api_base}/payments/detect-duplicates")
+        except Exception:
+            st.session_state.api_response_duplicates = None
+
+        try:
+            st.session_state.api_response_flagged = fetch_json("GET", f"{api_base}/payments/flagged")
+        except Exception:
+            st.session_state.api_response_flagged = None
+
+        try:
+            log_query = {
+                "payment_type": None,
+                "action": None,
+                "is_duplicate_update": None,
+                "limit": 100,
+                "offset": 0,
+            }
+            st.session_state.api_response_audit = fetch_json(
+                "POST", f"{api_base}/payments/audit-log", data=log_query
+            )
+        except Exception:
+            st.session_state.api_response_audit = None
+
+        display_audit_dashboard()
+    except Exception as exc:
+        st.error("Failed to load audit dashboard components")
+        st.write(str(exc))
 
 st.markdown(
 "<div class='footer-note'>Runs fully local. Collects analytics only. Does not automate annotation.</div>",

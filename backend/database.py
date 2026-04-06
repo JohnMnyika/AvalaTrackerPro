@@ -44,6 +44,16 @@ def ensure_schema() -> None:
             "source": "ALTER TABLE extension_heartbeats ADD COLUMN source STRING DEFAULT 'content_script'",
             "last_seen_at": "ALTER TABLE extension_heartbeats ADD COLUMN last_seen_at DATETIME",
         },
+        "payments_batches": {
+            "is_flagged": "ALTER TABLE payments_batches ADD COLUMN is_flagged INTEGER DEFAULT 0",
+            "flag_reason": "ALTER TABLE payments_batches ADD COLUMN flag_reason STRING",
+            "flagged_at": "ALTER TABLE payments_batches ADD COLUMN flagged_at DATETIME",
+        },
+        "payments_history": {
+            "is_flagged": "ALTER TABLE payments_history ADD COLUMN is_flagged INTEGER DEFAULT 0",
+            "flag_reason": "ALTER TABLE payments_history ADD COLUMN flag_reason STRING",
+            "flagged_at": "ALTER TABLE payments_history ADD COLUMN flagged_at DATETIME",
+        },
     }
     with engine.begin() as conn:
         for table_name, migrations in column_migrations.items():

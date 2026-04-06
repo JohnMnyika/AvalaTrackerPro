@@ -108,3 +108,66 @@ class ExtensionHeartbeatRequest(BaseModel):
     page_url: Optional[str] = None
     page_type: str = "unknown"
     source: str = "content_script"
+
+
+# ============= AUDIT SYSTEM SCHEMAS =============
+
+
+class PaymentAuditLogEntry(BaseModel):
+    id: int
+    payment_type: str
+    payment_id: Optional[int]
+    action: str
+    old_values: Optional[str]
+    new_values: Optional[str]
+    change_summary: Optional[str]
+    audit_timestamp: datetime
+    audit_user: str
+    audit_source: Optional[str]
+    is_duplicate_update: int
+
+    class Config:
+        from_attributes = True
+
+
+class PaymentDuplicateInfo(BaseModel):
+    id: int
+    primary_payment_type: str
+    primary_payment_id: int
+    duplicate_payment_type: str
+    duplicate_payment_id: int
+    match_key: str
+    similarity_score: float
+    has_value_difference: int
+    value_difference_summary: Optional[str]
+    reconciliation_status: str
+    detected_at: datetime
+    reconciled_at: Optional[datetime]
+    reconciliation_notes: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
+class DuplicateDetectionResult(BaseModel):
+    total_duplicates: int
+    pending_review: int
+    merged: int
+    ignored: int
+    duplicates: List[PaymentDuplicateInfo]
+
+
+class AuditLogQuery(BaseModel):
+    payment_type: Optional[str] = None  # 'batch', 'history', or None for all
+    action: Optional[str] = None  # 'created', 'updated', 'flagged', etc.
+    is_duplicate_update: Optional[int] = None
+    limit: int = Field(100, ge=1, le=1000)
+    offset: int = Field(0, ge=0)
+
+
+class ReconciliationAction(BaseModel):
+    duplicate_id: int
+    action_type: str = Field(..., pattern="^(kept_primary|use_higher_value|manual_merge|ignore)$")
+    action_notes: Optional[str] = None
+    final_value_used: Optional[str] = None  # JSON
+

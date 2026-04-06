@@ -24,6 +24,7 @@ avala-tracker-pro/
     database.py
     schemas.py
     session_manager.py
+    audit_service.py  # NEW: Payment audit and reconciliation service
   tracker/
     activity_monitor.py
     idle_detector.py
@@ -35,6 +36,7 @@ avala-tracker-pro/
   dashboard/
     dashboard.py
     charts.py
+    audit_dashboard.py  # NEW: Audit dashboard visualization
   extension/
     manifest.json
     background.js
@@ -95,6 +97,12 @@ streamlit run dashboard/dashboard.py
 - `POST /payments/sync`
 - `GET /payments/summary`
 - `GET /payments/batches`
+- `POST /payments/detect-duplicates` - **NEW**: Detect duplicate payments
+- `GET /payments/duplicates/pending` - **NEW**: Get pending duplicates
+- `POST /payments/reconcile` - **NEW**: Reconcile duplicate payments
+- `POST /payments/audit-log` - **NEW**: Query audit trail
+- `GET /payments/audit-stats` - **NEW**: Get audit statistics
+- `GET /payments/flagged` - **NEW**: Get flagged payments
 - `GET /analytics/overview`
 - `GET /analytics/performance`
 - `GET /analytics/today`

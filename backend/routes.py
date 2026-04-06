@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date, datetime
 import re
 
@@ -9,19 +10,24 @@ from sqlalchemy.orm import Session
 
 from analytics.metrics import compute_core_metrics, compute_payment_metrics
 from analytics.productivity import build_heatmap_data, build_performance_insights
+from backend.audit_service import AuditLogger, DuplicateDetector, PaymentReconciliationService
 from backend.database import get_db
-from backend.models import ContributionDay, ExtensionHeartbeat, FrameLog, PaymentBatch, PaymentHistory, PaymentSyncDebug, Session as WorkSession
+from backend.models import ContributionDay, ExtensionHeartbeat, FrameLog, PaymentAuditLog, PaymentBatch, PaymentDuplicate, PaymentHistory, PaymentSyncDebug, Session as WorkSession
 from backend.models import Task
 from backend.schemas import (
     ActivityPingRequest,
+    AuditLogQuery,
     ContributionSyncRequest,
+    DuplicateDetectionResult,
     ExtensionHeartbeatRequest,
     FrameLogRequest,
     GenericResponse,
     PaymentBatchRequest,
+    PaymentDuplicateInfo,
     PaymentHistoryRequest,
     PaymentSyncRequest,
     PaymentSyncDebugRequest,
+    ReconciliationAction,
     SessionResponse,
     TaskEndRequest,
     TaskStartRequest,
@@ -276,13 +282,58 @@ def sync_contributions(payload: ContributionSyncRequest, db: Session = Depends(g
 def add_payment_batch(payload: PaymentBatchRequest, db: Session = Depends(get_db)):
     batch_name = payload.batch_name.strip()
     record = db.query(PaymentBatch).filter(PaymentBatch.batch_name == batch_name).first()
+    
     if record is None:
-        record = PaymentBatch(batch_name=batch_name, amount_usd=max(float(payload.amount_usd or 0.0), 0.0))
+        record = PaymentBatch(
+            batch_name=batch_name,
+            amount_usd=max(float(payload.amount_usd or 0.0), 0.0)
+        )
         db.add(record)
+        db.flush()  # Get the ID without committing
+        
+        # Log the creation
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="batch",
+            payment_id=record.id,
+            action="created",
+            new_values={
+                "batch_name": record.batch_name,
+                "amount_usd": record.amount_usd,
+            },
+            audit_source="api",
+        )
         detail = "Payment batch added"
     else:
-        record.amount_usd = max(float(payload.amount_usd or 0.0), 0.0)
-        detail = "Payment batch updated"
+        # Log old values before update
+        old_amount = record.amount_usd
+        new_amount = max(float(payload.amount_usd or 0.0), 0.0)
+        
+        # Check for value differences (duplicate indicator)
+        is_duplicate_update = old_amount != new_amount
+        
+        record.amount_usd = new_amount
+        
+        # Flag if values changed (indicates duplicate with different amount)
+        if is_duplicate_update:
+            record.is_flagged = 1
+            record.flag_reason = "Duplicate entry detected with updated amount"
+            record.flagged_at = datetime.utcnow()
+        
+        # Log the update
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="batch",
+            payment_id=record.id,
+            action="updated",
+            old_values={"amount_usd": old_amount},
+            new_values={"amount_usd": new_amount},
+            audit_source="api",
+            is_duplicate_update=is_duplicate_update,
+        )
+        
+        detail = "Payment batch updated" + (" (duplicate flagged)" if is_duplicate_update else "")
+    
     db.commit()
     return GenericResponse(status="ok", detail=detail)
 
@@ -295,6 +346,7 @@ def add_payment_history(payload: PaymentHistoryRequest, db: Session = Depends(ge
         .first()
     )
     status = (payload.status or "completed").strip().lower()
+    
     if record is None:
         record = PaymentHistory(
             date=payload.date,
@@ -303,12 +355,71 @@ def add_payment_history(payload: PaymentHistoryRequest, db: Session = Depends(ge
             status=status,
         )
         db.add(record)
+        db.flush()  # Get the ID without committing
+        
+        # Log the creation
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="history",
+            payment_id=record.id,
+            action="created",
+            new_values={
+                "date": str(record.date),
+                "amount_usd": record.amount_usd,
+                "amount_kes": record.amount_kes,
+                "status": record.status,
+            },
+            audit_source="api",
+        )
         detail = "Payment history added"
     else:
-        record.amount_usd = max(float(payload.amount_usd or 0.0), 0.0)
-        record.amount_kes = max(float(payload.amount_kes or 0.0), 0.0)
+        # Log old values before update
+        old_values = {
+            "amount_usd": record.amount_usd,
+            "amount_kes": record.amount_kes,
+            "status": record.status,
+        }
+        
+        new_usd = max(float(payload.amount_usd or 0.0), 0.0)
+        new_kes = max(float(payload.amount_kes or 0.0), 0.0)
+        
+        # Check for value differences (duplicate indicator)
+        is_duplicate_update = (
+            record.amount_usd != new_usd
+            or record.amount_kes != new_kes
+            or record.status != status
+        )
+        
+        record.amount_usd = new_usd
+        record.amount_kes = new_kes
         record.status = status
-        detail = "Payment history updated"
+        
+        # Flag if values changed (indicates duplicate with different amount)
+        if is_duplicate_update:
+            record.is_flagged = 1
+            record.flag_reason = "Duplicate entry detected with updated values"
+            record.flagged_at = datetime.utcnow()
+        
+        new_values = {
+            "amount_usd": new_usd,
+            "amount_kes": new_kes,
+            "status": status,
+        }
+        
+        # Log the update
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="history",
+            payment_id=record.id,
+            action="updated",
+            old_values=old_values,
+            new_values=new_values,
+            audit_source="api",
+            is_duplicate_update=is_duplicate_update,
+        )
+        
+        detail = "Payment history updated" + (" (duplicate flagged)" if is_duplicate_update else "")
+    
     db.commit()
     return GenericResponse(status="ok", detail=detail)
 
@@ -413,3 +524,227 @@ def analytics_today(db: Session = Depends(get_db)):
             for t in tasks_today
         ],
     }
+
+
+# ============= PAYMENT AUDIT & RECONCILIATION ENDPOINTS =============
+
+
+@router.post("/payments/detect-duplicates", response_model=DuplicateDetectionResult)
+def detect_duplicates(db: Session = Depends(get_db)):
+    """
+    Detect duplicate payments and return results.
+    Scans both PaymentBatch and PaymentHistory for exact matches.
+    """
+    batch_dups, history_dups = DuplicateDetector.detect_all_duplicates(db)
+    
+    # Get all duplicates
+    all_dups = db.query(PaymentDuplicate).all()
+    
+    # Calculate summary
+    summary = PaymentReconciliationService.get_duplicate_summary(db)
+    
+    # Convert to response schema
+    duplicate_infos = [
+        PaymentDuplicateInfo(
+            id=dup.id,
+            primary_payment_type=dup.primary_payment_type,
+            primary_payment_id=dup.primary_payment_id,
+            duplicate_payment_type=dup.duplicate_payment_type,
+            duplicate_payment_id=dup.duplicate_payment_id,
+            match_key=dup.match_key,
+            similarity_score=dup.similarity_score,
+            has_value_difference=dup.has_value_difference,
+            value_difference_summary=dup.value_difference_summary,
+            reconciliation_status=dup.reconciliation_status,
+            detected_at=dup.detected_at,
+            reconciled_at=dup.reconciled_at,
+            reconciliation_notes=dup.reconciliation_notes,
+        )
+        for dup in all_dups
+    ]
+    
+    return DuplicateDetectionResult(
+        total_duplicates=summary["total_duplicates"],
+        pending_review=summary["pending_review"],
+        merged=summary["merged"],
+        ignored=summary["ignored"],
+        duplicates=duplicate_infos,
+    )
+
+
+@router.get("/payments/duplicates/pending")
+def get_pending_duplicates(db: Session = Depends(get_db)):
+    """Get all pending duplicates awaiting reconciliation."""
+    pending = PaymentReconciliationService.get_pending_duplicates(db)
+    
+    return {
+        "count": len(pending),
+        "duplicates": [
+            {
+                "id": dup.id,
+                "primary_payment_type": dup.primary_payment_type,
+                "primary_payment_id": dup.primary_payment_id,
+                "duplicate_payment_type": dup.duplicate_payment_type,
+                "duplicate_payment_id": dup.duplicate_payment_id,
+                "match_key": dup.match_key,
+                "has_value_difference": dup.has_value_difference,
+                "value_difference_summary": dup.value_difference_summary,
+                "detected_at": dup.detected_at.isoformat(),
+            }
+            for dup in pending
+        ],
+    }
+
+
+@router.post("/payments/reconcile", response_model=GenericResponse)
+def reconcile_payment_duplicate(
+    payload: ReconciliationAction,
+    db: Session = Depends(get_db),
+):
+    """
+    Reconcile a duplicate payment entry.
+    Performs the specified action and logs all changes to the audit trail.
+    """
+    final_value_used = payload.final_value_used
+    if isinstance(final_value_used, str):
+        try:
+            final_value_used = json.loads(final_value_used)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="final_value_used must be valid JSON")
+
+    reconciliation = PaymentReconciliationService.reconcile_duplicate(
+        db=db,
+        duplicate_id=payload.duplicate_id,
+        action_type=payload.action_type,
+        action_user="api_user",
+        action_notes=payload.action_notes,
+        final_value_used=final_value_used,
+    )
+    
+    if not reconciliation:
+        raise HTTPException(status_code=404, detail="Duplicate payment not found")
+    
+    return GenericResponse(
+        status="ok",
+        detail=f"Duplicate payment reconciled with action: {payload.action_type}",
+    )
+
+
+@router.post("/payments/audit-log", response_model=dict)
+def query_audit_logs(payload: AuditLogQuery, db: Session = Depends(get_db)):
+    """
+    Query the payment audit log with optional filtering.
+    Returns all changes, updates, and flags applied to payments.
+    """
+    logs, total = AuditLogger.get_audit_log(
+        db=db,
+        payment_type=payload.payment_type,
+        action=payload.action,
+        is_duplicate_update=payload.is_duplicate_update,
+        limit=payload.limit,
+        offset=payload.offset,
+    )
+    
+    return {
+        "total": total,
+        "limit": payload.limit,
+        "offset": payload.offset,
+        "items": [
+            {
+                "id": log.id,
+                "payment_type": log.payment_type,
+                "payment_id": log.payment_id,
+                "action": log.action,
+                "old_values": log.old_values,
+                "new_values": log.new_values,
+                "change_summary": log.change_summary,
+                "audit_timestamp": log.audit_timestamp.isoformat(),
+                "audit_user": log.audit_user,
+                "audit_source": log.audit_source,
+                "is_duplicate_update": log.is_duplicate_update,
+            }
+            for log in logs
+        ],
+    }
+
+
+@router.get("/payments/audit-stats")
+def get_audit_statistics(db: Session = Depends(get_db)):
+    """Get statistics about payment audit trail and duplicates."""
+    from sqlalchemy import func as sql_func
+    
+    # Audit log stats
+    total_audit_entries = db.query(PaymentAuditLog).count()
+    duplicate_updates = (
+        db.query(PaymentAuditLog)
+        .filter(PaymentAuditLog.is_duplicate_update == 1)
+        .count()
+    )
+    
+    # Group by action type
+    action_counts = (
+        db.query(
+            PaymentAuditLog.action,
+            sql_func.count(PaymentAuditLog.id).label("count"),
+        )
+        .group_by(PaymentAuditLog.action)
+        .all()
+    )
+    
+    # Duplicate stats
+    dup_summary = PaymentReconciliationService.get_duplicate_summary(db)
+    
+    # Flagged payments
+    flagged_batches = db.query(PaymentBatch).filter(PaymentBatch.is_flagged == 1).count()
+    flagged_history = db.query(PaymentHistory).filter(PaymentHistory.is_flagged == 1).count()
+    
+    return {
+        "audit": {
+            "total_entries": total_audit_entries,
+            "duplicate_update_entries": duplicate_updates,
+            "by_action": {action: count for action, count in action_counts},
+        },
+        "duplicates": dup_summary,
+        "flagged_payments": {
+            "batches": flagged_batches,
+            "history": flagged_history,
+            "total": flagged_batches + flagged_history,
+        },
+    }
+
+
+@router.get("/payments/flagged")
+def get_flagged_payments(db: Session = Depends(get_db)):
+    """Get all flagged payments (those with detected duplicates or issues)."""
+    flagged_batches = db.query(PaymentBatch).filter(PaymentBatch.is_flagged == 1).all()
+    flagged_histories = (
+        db.query(PaymentHistory).filter(PaymentHistory.is_flagged == 1).all()
+    )
+    
+    return {
+        "batches": [
+            {
+                "id": batch.id,
+                "batch_name": batch.batch_name,
+                "amount_usd": batch.amount_usd,
+                "flag_reason": batch.flag_reason,
+                "flagged_at": batch.flagged_at.isoformat() if batch.flagged_at else None,
+                "created_at": batch.created_at.isoformat() if batch.created_at else None,
+            }
+            for batch in flagged_batches
+        ],
+        "history": [
+            {
+                "id": hist.id,
+                "date": str(hist.date),
+                "amount_usd": hist.amount_usd,
+                "amount_kes": hist.amount_kes,
+                "status": hist.status,
+                "flag_reason": hist.flag_reason,
+                "flagged_at": hist.flagged_at.isoformat() if hist.flagged_at else None,
+            }
+            for hist in flagged_histories
+        ],
+        "total_flagged": len(flagged_batches) + len(flagged_histories),
+    }
+
