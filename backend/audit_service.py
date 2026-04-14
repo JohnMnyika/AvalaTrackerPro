@@ -182,6 +182,7 @@ class AuditLogger:
         audit_user: str = "system",
         audit_source: str = "api",
         is_duplicate_update: bool = False,
+        auto_commit: bool = True,
     ) -> PaymentAuditLog:
         """
         Create an audit log entry for a payment change.
@@ -214,7 +215,10 @@ class AuditLogger:
             is_duplicate_update=1 if is_duplicate_update else 0,
         )
         db.add(log_entry)
-        db.commit()
+        if auto_commit:
+            db.commit()
+        else:
+            db.flush()
         return log_entry
 
     @staticmethod

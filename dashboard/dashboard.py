@@ -20,7 +20,7 @@ from analytics.metrics import compute_core_metrics
 from analytics.predictions import productivity_trend_prediction
 from analytics.productivity import build_heatmap_data, build_performance_insights, build_period_summaries
 from backend.database import SessionLocal, ensure_schema
-from backend.models import ContributionDay, FrameLog
+from backend.models import ContributionDay, FrameLog, VisionAnalysis
 from backend.models import Session as WorkSession
 from backend.models import Task
 from charts import (
@@ -223,6 +223,7 @@ def load_dashboard_snapshot() -> dict:
         session_rows = db.query(WorkSession).all()
         frame_logs = db.query(FrameLog).all()
         contribution_days = db.query(ContributionDay).all()
+        vision_rows = db.query(VisionAnalysis).order_by(VisionAnalysis.processed_at.desc()).limit(50).all()
         joined_frame_logs = (
             db.query(FrameLog, Task)
             .join(Task, Task.id == FrameLog.task_id)
@@ -1007,6 +1008,10 @@ elif current_view == "payments":
               <div class="stat-value">{int(payment_metrics.get('payment_history_synced_count', 0))}</div>
             </div>
             <div>
+              <div class="stat-kicker">Schema</div>
+              <div class="stat-value">{str(payment_metrics.get('schema_status', 'unknown')).replace('_', ' ').title()}</div>
+            </div>
+            <div>
               <div class="stat-kicker">Last Batch Sync</div>
               <div class="stat-value" style="font-size:1.15rem;">{payment_metrics.get('last_recent_work_sync_at', '—') or '—'}</div>
             </div>
@@ -1020,6 +1025,9 @@ elif current_view == "payments":
         st.caption(f"Latest payment history date: {payment_metrics['last_payment_history_date']}")
     else:
         st.caption("Open pay.avala.ai/dashboard and wait for the Recent Work Added and Payment History sections to render fully.")
+
+    if payment_metrics.get("schema_status") != "ok":
+        st.caption(payment_metrics.get("schema_status_message") or "Database schema may need migration. Restart the backend.")
 
     has_payment_data = bool(
         float(payment_metrics.get("total_earnings_usd", 0.0)) > 0
@@ -1191,6 +1199,24 @@ elif current_view == "payments":
 
 elif current_view == "quality":
     render_insights(insights, prediction, metrics)
+    try:
+        with SessionLocal() as db:
+            suggestions = db.query(VisionAnalysis).order_by(VisionAnalysis.processed_at.desc()).limit(20).all()
+        if suggestions:
+            st.markdown("## Vision Assistance Suggestions")
+            suggestion_rows = [
+                {
+                    "Task UID": row.task_uid or "unknown",
+                    "Frame": int(row.frame_number or 0),
+                    "Suggested Changes": int(row.suggestions_count or 0),
+                    "Saved (s)": round(float(row.time_saved_estimate_seconds or 0.0), 2),
+                    "Captured": row.processed_at.strftime("%Y-%m-%d %H:%M:%S") if row.processed_at else "",
+                }
+                for row in suggestions
+            ]
+            st.dataframe(pd.DataFrame(suggestion_rows), width='stretch', hide_index=True)
+    except Exception:
+        st.info("Vision suggestion history is not available yet.")
 
 elif current_view == "profile":
     profile1, profile2, profile3, profile4 = st.columns(4)

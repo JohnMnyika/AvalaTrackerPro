@@ -10,6 +10,7 @@ A local productivity analytics platform for tracking annotation work on `avala.a
 - Analytics engine for efficiency and distributions
 - Payments and earnings sync support
 - Streamlit dashboard with Plotly graphs
+- AI-assisted bounding-box suggestion overlay for Avala.ai task pages
 - Daily/weekly report scripts
 - Earnings estimation and productivity heatmap
 
@@ -97,6 +98,7 @@ streamlit run dashboard/dashboard.py
 - `POST /payments/sync`
 - `GET /payments/summary`
 - `GET /payments/batches`
+- `POST /vision/analyze` - **NEW**: Analyze current task frame and suggest bounding-box improvements
 - `POST /payments/detect-duplicates` - **NEW**: Detect duplicate payments
 - `GET /payments/duplicates/pending` - **NEW**: Get pending duplicates
 - `POST /payments/reconcile` - **NEW**: Reconcile duplicate payments

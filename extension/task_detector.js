@@ -180,11 +180,21 @@
       "[data-annotation-id]",
       "[data-testid*='annotation']",
       "[data-testid*='cuboid']",
+      "[data-box-id]",
+      "[data-bounds]",
+      "[data-bbox]",
       "[class*='annotation']",
       "[class*='cuboid']",
+      "[class*='box']",
+      "[aria-label*='annotation']",
+      "[aria-label*='box']",
       "svg [data-id]",
+      "svg [data-label]",
       "svg [class*='box']",
-      "svg [class*='cuboid']"
+      "svg [class*='cuboid']",
+      "svg rect[data-id]",
+      "svg polygon[data-id]",
+      "svg path[data-id]"
     ];
 
     let count = 0;
@@ -391,17 +401,154 @@
     return deduped;
   }
 
+  function extractBatchName(text) {
+    if (!text) return null;
+    const match = String(text).toLowerCase().match(/\bbatch[-_]\d+(?:[-_][a-z]+)+(?=about|\b|[^a-z0-9])/);
+    return match ? sanitizeBatchName(match[0]) : null;
+  }
+
+  function sanitizeBatchName(value) {
+    if (!value) return null;
+    let normalized = String(value).toLowerCase().replace(/_/g, "-").trim();
+    normalized = normalized.replace(/(?:about|ago|hours?|days?|minutes?|months?)$/i, "");
+    normalized = normalized.replace(/\d{1,2}$/i, "");
+    normalized = normalized.replace(/-+/g, "-").replace(/-$/, "");
+    return /\bbatch-\d+(?:-[a-z]+)+\b/.test(normalized) ? normalized : null;
+  }
+
+  function escapeRegex(value) {
+    return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function extractBatchNumber(batchName) {
+    if (!batchName) return null;
+    const match = String(batchName).match(/\bbatch-(\d+)\b/i);
+    return match ? Number(match[1]) : null;
+  }
+
+  function isLikelyBatchAmount(value, batchName) {
+    if (!Number.isFinite(value) || value < 0) return false;
+    if (value > 100) return false;
+    const batchNumber = extractBatchNumber(batchName);
+    if (Number.isFinite(batchNumber) && value === batchNumber) return false;
+    return true;
+  }
+
+  function collectNodeTextCandidates(node) {
+    if (!node) return [];
+    const candidates = [];
+    const seen = new Set();
+
+    function push(value) {
+      const normalized = String(value || "").replace(/\s+/g, " ").trim();
+      if (!normalized || seen.has(normalized)) return;
+      seen.add(normalized);
+      candidates.push(normalized);
+    }
+
+    push(node.textContent || "");
+    for (const child of node.querySelectorAll("*")) {
+      push(child.textContent || "");
+      push(child.getAttribute && child.getAttribute("aria-label"));
+      push(child.getAttribute && child.getAttribute("title"));
+      push(child.getAttribute && child.getAttribute("data-tooltip"));
+    }
+    return candidates;
+  }
+
+  function parseLooseUsd(text) {
+    if (!text) return null;
+    const normalized = String(text).replace(/,/g, "");
+    const matches = Array.from(normalized.matchAll(/(\d+(?:\.\d+)?)(?!\s*h\b)/gi));
+    if (!matches.length) return null;
+    const filtered = matches
+      .map((match) => Number(match[1]))
+      .filter((value) => Number.isFinite(value));
+    if (!filtered.length) return null;
+    return filtered[filtered.length - 1];
+  }
+
+  function sanitizeAmountText(text, batchName) {
+    return String(text || "")
+      .replace(new RegExp(escapeRegex(batchName || ""), "ig"), " ")
+      .replace(/(?:about\s+\d+\s+(?:minutes?|hours?|days?|months?)|\d+\s+(?:minutes?|hours?|days?|months?))(?:\s+ago)?/ig, " ")
+      .replace(/\b\d+(?:\.\d+)?h\b/ig, " ")
+      .replace(/\bitems?\b/ig, " ")
+      .replace(/\bhours?\b/ig, " ");
+  }
+
+  function extractRecentWorkRowFromItem(item) {
+    const textCandidates = collectNodeTextCandidates(item);
+    const mergedText = textCandidates.join(" | ");
+    const batchName = extractBatchName(mergedText);
+    if (!batchName) return null;
+
+    let amount = null;
+    for (const text of textCandidates) {
+      amount = parseUsd(text);
+      if (isLikelyBatchAmount(amount, batchName)) break;
+    }
+    if (!isLikelyBatchAmount(amount, batchName)) {
+      const sanitizedText = sanitizeAmountText(mergedText, batchName);
+      amount = parseLooseUsd(sanitizedText);
+    }
+    if (!isLikelyBatchAmount(amount, batchName)) {
+      for (const text of textCandidates) {
+        const sanitizedText = sanitizeAmountText(text, batchName);
+        amount = parseLooseUsd(sanitizedText);
+        if (isLikelyBatchAmount(amount, batchName)) break;
+      }
+    }
+    if (!isLikelyBatchAmount(amount, batchName)) return null;
+
+    const timestampMatch = mergedText.match(/(?:about\s+\d+\s+(?:minutes?|hours?|days?|months?)|\d+\s+(?:minutes?|hours?|days?|months?))(?:\s+ago)?/i);
+    return {
+      batch_name: batchName,
+      amount_usd: amount,
+      timestamp: timestampMatch ? timestampMatch[0] : null,
+      source: "recent_work"
+    };
+  }
+
+  function extractHistoryRowFromItem(item) {
+    const textCandidates = collectNodeTextCandidates(item);
+    const mergedText = textCandidates.join(" | ");
+    const dateMatch = mergedText.match(/([A-Z][a-z]{2}\s+\d{1,2},\s*\d{4})/);
+    const normalizedDate = normalizeHistoryDate(dateMatch && dateMatch[1]);
+    if (!normalizedDate) return null;
+
+    let amountUsd = null;
+    let amountKes = null;
+    for (const text of textCandidates) {
+      if (!Number.isFinite(amountUsd)) amountUsd = parseUsd(text);
+      if (!Number.isFinite(amountKes)) amountKes = parseKes(text);
+      if (Number.isFinite(amountUsd) && Number.isFinite(amountKes)) break;
+    }
+    if (!Number.isFinite(amountUsd)) {
+      amountUsd = parseLooseUsd(mergedText);
+    }
+    if (!Number.isFinite(amountUsd)) return null;
+
+    const statusMatch = mergedText.match(/\b(completed|pending|failed|processing)\b/i);
+    return {
+      date: normalizedDate,
+      amount_usd: amountUsd,
+      amount_kes: Number.isFinite(amountKes) ? amountKes : 0,
+      status: statusMatch ? statusMatch[1].toLowerCase() : "completed"
+    };
+  }
+
   function parseRecentWorkText(text) {
     const scoped = extractPaymentSectionText(text, 'Recent Work Added', ['Payment History', 'Bonuses & Deductions']);
     if (!scoped) return [];
     const rows = [];
-    const pattern = /(batch-\d+(?:-[a-z0-9]+)+)(?:[A-Za-z]+)?[\s\S]{0,50}((?:about\s+\d+\s+(?:minutes?|hours?|days?))|(?:\d+\s+(?:minutes?|hours?|days?))|(?:about\s+1\s+month)|(?:\d+\s+months?)|(?:1\s+day))(?:\s+ago)?[\s\S]{0,50}?(\d+(?:\.\d{2}))/gi;
+    const pattern = /(batch[-_]\d+(?:[-_][a-z]+)+)(?:[A-Za-z]+)?[\s\S]{0,50}((?:about\s+\d+\s+(?:minutes?|hours?|days?))|(?:\d+\s+(?:minutes?|hours?|days?))|(?:about\s+1\s+month)|(?:\d+\s+months?)|(?:1\s+day))(?:\s+ago)?[\s\S]{0,50}?(\d+(?:\.\d+)?)/gi;
     let match;
     while ((match = pattern.exec(scoped)) !== null) {
-      const batchName = match[1];
+      const batchName = sanitizeBatchName(match[1]);
       const timestamp = match[2];
       const amount = Number(match[3]);
-      if (!batchName || !Number.isFinite(amount)) continue;
+      if (!batchName || !isLikelyBatchAmount(amount, batchName)) continue;
       rows.push({
         batch_name: batchName,
         amount_usd: amount,
@@ -413,6 +560,14 @@
   }
 
   function parseRecentWorkItems(items) {
+    const rows = [];
+    for (const item of items || []) {
+      const parsed = extractRecentWorkRowFromItem(item);
+      if (parsed) rows.push(parsed);
+    }
+    if (rows.length) {
+      return dedupeBy(rows, (row) => `${row.batch_name}|${row.amount_usd}`);
+    }
     const combinedText = items
       .map((item) => (item.textContent || '').replace(/\s+/g, ' ').trim())
       .filter(Boolean)
@@ -443,6 +598,14 @@
   }
 
   function parsePaymentHistoryItems(items) {
+    const rows = [];
+    for (const item of items || []) {
+      const parsed = extractHistoryRowFromItem(item);
+      if (parsed) rows.push(parsed);
+    }
+    if (rows.length) {
+      return dedupeBy(rows, (row) => `${row.date}|${row.amount_usd}|${row.amount_kes}|${row.status}`);
+    }
     const combinedText = items
       .map((item) => (item.textContent || '').replace(/\s+/g, ' ').trim())
       .filter(Boolean)
@@ -456,35 +619,35 @@
   }
 
   function extractRecentWorkFromDom() {
-    for (const candidate of getPaymentTextCandidates()) {
-      const rows = parseRecentWorkText(candidate);
-      if (rows.length) return rows;
-    }
+    const rows = [];
     const section = findSectionRootByHeading('Recent Work Added');
     if (section) {
+      const rowsFromItems = parseRecentWorkItems(collectSectionItems(section));
+      rows.push(...rowsFromItems);
       const sectionText = ((section.innerText || section.textContent) || '').replace(/\s+/g, ' ').trim();
       const rowsFromText = parseRecentWorkText(sectionText);
-      if (rowsFromText.length) return rowsFromText;
-      const rowsFromItems = parseRecentWorkItems(collectSectionItems(section));
-      if (rowsFromItems.length) return rowsFromItems;
+      rows.push(...rowsFromText);
     }
-    return [];
+    for (const candidate of getPaymentTextCandidates()) {
+      rows.push(...parseRecentWorkText(candidate));
+    }
+    return dedupeBy(rows, (row) => `${row.batch_name}|${row.amount_usd}`);
   }
 
   function extractPaymentHistoryFromDom() {
-    for (const candidate of getPaymentTextCandidates()) {
-      const rows = parsePaymentHistoryText(candidate);
-      if (rows.length) return rows;
-    }
+    const rows = [];
     const section = findSectionRootByHeading('Payment History');
     if (section) {
+      const rowsFromItems = parsePaymentHistoryItems(collectSectionItems(section));
+      rows.push(...rowsFromItems);
       const sectionText = ((section.innerText || section.textContent) || '').replace(/\s+/g, ' ').trim();
       const rowsFromText = parsePaymentHistoryText(sectionText);
-      if (rowsFromText.length) return rowsFromText;
-      const rowsFromItems = parsePaymentHistoryItems(collectSectionItems(section));
-      if (rowsFromItems.length) return rowsFromItems;
+      rows.push(...rowsFromText);
     }
-    return [];
+    for (const candidate of getPaymentTextCandidates()) {
+      rows.push(...parsePaymentHistoryText(candidate));
+    }
+    return dedupeBy(rows, (row) => `${row.date}|${row.amount_usd}|${row.amount_kes}|${row.status}`);
   }
 
   function isPaymentMutationRelevant(target) {

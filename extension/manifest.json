@@ -5,7 +5,8 @@
   "description": "Local analytics tracker for avala.ai annotation productivity.",
   "permissions": [
     "tabs",
-    "storage"
+    "storage",
+    "activeTab"
   ],
   "host_permissions": [
     "https://avala.ai/*",

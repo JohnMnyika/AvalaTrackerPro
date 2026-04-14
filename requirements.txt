@@ -9,3 +9,5 @@ streamlit==1.56.0
 plotly==6.6.0
 pynput==1.8.1
 psutil==7.2.2
+ultralytics==8.0.171
+opencv-python==4.8.1.78

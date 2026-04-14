@@ -37,6 +37,23 @@
       if (Array.isArray(val)) {
         if (["annotations", "cuboids", "boxes", "objects", "labels", "annotations3d", "cuboidannotations"].includes(lower)) {
           out.boxes_count = val.length;
+          const boxArray = [];
+          for (const entry of val) {
+            if (!entry || typeof entry !== "object") continue;
+            const x1 = Number(entry.x1 ?? entry.left ?? entry.min_x ?? entry.minx ?? entry["x"] ?? NaN);
+            const y1 = Number(entry.y1 ?? entry.top ?? entry.min_y ?? entry.miny ?? entry["y"] ?? NaN);
+            const x2 = Number(entry.x2 ?? entry.right ?? entry.max_x ?? entry.maxx ?? (Number.isFinite(x1) && Number.isFinite(entry.width) ? x1 + Number(entry.width) : NaN));
+            const y2 = Number(entry.y2 ?? entry.bottom ?? entry.max_y ?? entry.maxy ?? (Number.isFinite(y1) && Number.isFinite(entry.height) ? y1 + Number(entry.height) : NaN));
+            if ([x1, y1, x2, y2].every((num) => Number.isFinite(num))) {
+              boxArray.push({
+                label: String(entry.label || entry.class || entry.category || "object"),
+                box: [x1, y1, x2, y2],
+              });
+            }
+          }
+          if (boxArray.length) {
+            out.existing_boxes = boxArray;
+          }
         }
       }
 

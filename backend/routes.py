@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from datetime import date, datetime
 import re
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func
@@ -11,20 +14,36 @@ from sqlalchemy.orm import Session
 from analytics.metrics import compute_core_metrics, compute_payment_metrics
 from analytics.productivity import build_heatmap_data, build_performance_insights
 from backend.audit_service import AuditLogger, DuplicateDetector, PaymentReconciliationService
+from backend.batch_matching import extract_batch_anchor, normalize_batch_name
 from backend.database import get_db
-from backend.models import ContributionDay, ExtensionHeartbeat, FrameLog, PaymentAuditLog, PaymentBatch, PaymentDuplicate, PaymentHistory, PaymentSyncDebug, Session as WorkSession
-from backend.models import Task
+from backend.models import (
+    ContributionDay,
+    ExtensionHeartbeat,
+    FrameLog,
+    PaymentAuditLog,
+    PaymentBatch,
+    PaymentDuplicate,
+    PaymentHistory,
+    PaymentSyncDebug,
+    Session as WorkSession,
+    Task,
+    VisionAnalysis,
+)
 from backend.schemas import (
     ActivityPingRequest,
     AuditLogQuery,
+    BoundingBox,
     ContributionSyncRequest,
     DuplicateDetectionResult,
     ExtensionHeartbeatRequest,
     FrameLogRequest,
     GenericResponse,
     PaymentBatchRequest,
+    PaymentFullSyncRequest,
+    PaymentFullSyncResponse,
     PaymentDuplicateInfo,
     PaymentHistoryRequest,
+    PaymentSyncResult,
     PaymentSyncRequest,
     PaymentSyncDebugRequest,
     ReconciliationAction,
@@ -32,7 +51,11 @@ from backend.schemas import (
     TaskEndRequest,
     TaskStartRequest,
     TaskUpdateRequest,
+    VisionAnalyzeRequest,
+    VisionAnalyzeResponse,
+    VisionSuggestion,
 )
+from backend.vision_service import VisionAnalyzer
 from tracker.frame_tracker import calculate_frame_speed
 
 CAMERA_NORMALIZE_RE = re.compile(r'\s*\(CAM\s*\d+\)\s*$', re.IGNORECASE)
@@ -44,6 +67,7 @@ def normalize_camera_name(camera_raw: str | None) -> str | None:
     return CAMERA_NORMALIZE_RE.sub('', camera_raw.strip())
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 session_manager = None
 
@@ -84,6 +108,315 @@ def _upsert_payment_sync_debug(payload: PaymentSyncDebugRequest, db: Session) ->
 SYNTHETIC_TASK_UID_RE = re.compile(r"^task-[0-9a-f]{5,}$")
 
 
+def _normalize_batch_name(batch_name: str | None) -> str:
+    return normalize_batch_name(batch_name)
+
+
+def _normalize_payment_status(status: str | None) -> str:
+    return (status or "completed").strip().lower()
+
+
+def _coerce_non_negative_amount(value: Any) -> float:
+    return max(float(value or 0.0), 0.0)
+
+
+def _extract_batch_numeric_id(batch_name: str | None) -> int | None:
+    match = re.search(r"\bbatch-(\d+)\b", normalize_batch_name(batch_name))
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _is_likely_batch_amount(batch_name: str | None, amount_usd: float) -> bool:
+    if not isinstance(amount_usd, (int, float)):
+        return False
+    if amount_usd < 0 or amount_usd > 100:
+        return False
+    batch_id = _extract_batch_numeric_id(batch_name)
+    if batch_id is not None and float(batch_id) == float(amount_usd):
+        return False
+    return True
+
+
+def _build_snapshot_hash(batches: list[dict[str, Any]], history: list[dict[str, Any]]) -> str:
+    canonical_payload = {
+        "batches": sorted(batches, key=lambda item: item["batch_name"]),
+        "history": sorted(history, key=lambda item: item["date"]),
+    }
+    encoded = json.dumps(canonical_payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _find_matching_tasks_for_payment(db: Session, normalized_batch_name: str) -> list[Task]:
+    exact_matches = (
+        db.query(Task)
+        .filter(Task.normalized_batch_name == normalized_batch_name)
+        .all()
+    )
+    if exact_matches:
+        return exact_matches
+
+    anchor = extract_batch_anchor(normalized_batch_name)
+    if not anchor:
+        return []
+
+    anchor_matches = [
+        task for task in db.query(Task).all()
+        if extract_batch_anchor(task.normalized_batch_name or task.dataset) == anchor
+    ]
+    normalized_candidates = {
+        normalize_batch_name(task.normalized_batch_name or task.dataset)
+        for task in anchor_matches
+    }
+    if len(normalized_candidates) == 1:
+        return anchor_matches
+    return []
+
+
+def _mark_matching_tasks_paid(
+    db: Session,
+    *,
+    payment_batch_name: str,
+    normalized_batch_name: str,
+    amount_usd: float,
+    seen_at: datetime,
+) -> int:
+    matched_tasks = _find_matching_tasks_for_payment(db, normalized_batch_name)
+    updated_count = 0
+    for task in matched_tasks:
+        source_name = task.dataset or task.normalized_batch_name or ""
+        logger.info("Matched %s -> %s", payment_batch_name, source_name)
+        task.normalized_batch_name = normalize_batch_name(task.dataset)
+        task.payment_status = "paid"
+        task.paid_amount_usd = amount_usd
+        task.payment_updated_at = seen_at
+        updated_count += 1
+    return updated_count
+
+
+def _reconcile_task_payment_status(task: Task, db: Session) -> None:
+    task.normalized_batch_name = normalize_batch_name(task.dataset)
+    if not task.normalized_batch_name:
+        task.payment_status = "unpaid"
+        task.paid_amount_usd = 0.0
+        return
+
+    exact = (
+        db.query(PaymentBatch)
+        .filter(PaymentBatch.normalized_batch_name == task.normalized_batch_name)
+        .order_by(PaymentBatch.updated_at.desc(), PaymentBatch.created_at.desc())
+        .first()
+    )
+    candidate = exact
+    if candidate is None:
+        anchor = extract_batch_anchor(task.normalized_batch_name)
+        if anchor:
+            fuzzy_candidates = [
+                payment for payment in db.query(PaymentBatch).all()
+                if extract_batch_anchor(payment.normalized_batch_name or payment.batch_name) == anchor
+            ]
+            normalized_candidates = {
+                normalize_batch_name(payment.normalized_batch_name or payment.batch_name)
+                for payment in fuzzy_candidates
+            }
+            if len(normalized_candidates) == 1 and fuzzy_candidates:
+                candidate = sorted(
+                    fuzzy_candidates,
+                    key=lambda payment: (
+                        payment.updated_at or payment.created_at or datetime.min,
+                        payment.amount_usd,
+                    ),
+                    reverse=True,
+                )[0]
+    if candidate is None:
+        task.payment_status = "unpaid"
+        task.paid_amount_usd = 0.0
+        return
+
+    logger.info("Matched %s -> %s", candidate.batch_name, task.dataset)
+    task.payment_status = "paid"
+    task.paid_amount_usd = candidate.amount_usd
+    task.payment_updated_at = candidate.updated_at or candidate.created_at
+
+
+def _sync_single_batch(
+    batch_payload: PaymentBatchRequest,
+    db: Session,
+    *,
+    seen_at: datetime,
+    audit_source: str,
+) -> str:
+    batch_name = _normalize_batch_name(batch_payload.batch_name)
+    normalized_batch_name = normalize_batch_name(batch_payload.batch_name)
+    amount_usd = _coerce_non_negative_amount(batch_payload.amount_usd)
+    if not _is_likely_batch_amount(batch_payload.batch_name, amount_usd):
+        raise ValueError(f"Invalid batch amount for {batch_payload.batch_name}: {amount_usd}")
+
+    matching_records = (
+        db.query(PaymentBatch)
+        .filter(
+            (PaymentBatch.normalized_batch_name == normalized_batch_name)
+            | (PaymentBatch.batch_name == batch_name)
+        )
+        .order_by(PaymentBatch.updated_at.desc(), PaymentBatch.created_at.desc(), PaymentBatch.id.asc())
+        .all()
+    )
+    record = matching_records[0] if matching_records else None
+
+    if record is None:
+        record = PaymentBatch(
+            batch_name=batch_name,
+            normalized_batch_name=normalized_batch_name,
+            amount_usd=amount_usd,
+            created_at=seen_at,
+            updated_at=seen_at,
+            last_seen_at=seen_at,
+            is_updated=0,
+        )
+        db.add(record)
+        db.flush()
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="batch",
+            payment_id=record.id,
+            action="created",
+            new_values={"batch_name": batch_name, "normalized_batch_name": normalized_batch_name, "amount_usd": amount_usd},
+            audit_source=audit_source,
+            auto_commit=False,
+        )
+        _mark_matching_tasks_paid(
+            db,
+            payment_batch_name=batch_payload.batch_name,
+            normalized_batch_name=normalized_batch_name,
+            amount_usd=amount_usd,
+            seen_at=seen_at,
+        )
+        return "inserted"
+
+    record.normalized_batch_name = normalized_batch_name
+    record.batch_name = batch_name
+    duplicate_records = matching_records[1:]
+    for duplicate in duplicate_records:
+        db.delete(duplicate)
+    if record.amount_usd != amount_usd:
+        old_values = {"amount_usd": record.amount_usd}
+        record.amount_usd = amount_usd
+        record.updated_at = seen_at
+        record.last_seen_at = seen_at
+        record.is_updated = 1
+        record.is_flagged = 1
+        record.flag_reason = "Payment batch value changed during full sync"
+        record.flagged_at = seen_at
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="batch",
+            payment_id=record.id,
+            action="updated",
+            old_values=old_values,
+            new_values={"amount_usd": amount_usd},
+            audit_source=audit_source,
+            is_duplicate_update=True,
+            auto_commit=False,
+        )
+        _mark_matching_tasks_paid(
+            db,
+            payment_batch_name=batch_payload.batch_name,
+            normalized_batch_name=normalized_batch_name,
+            amount_usd=amount_usd,
+            seen_at=seen_at,
+        )
+        return "updated"
+
+    record.last_seen_at = seen_at
+    _mark_matching_tasks_paid(
+        db,
+        payment_batch_name=batch_payload.batch_name,
+        normalized_batch_name=normalized_batch_name,
+        amount_usd=amount_usd,
+        seen_at=seen_at,
+    )
+    return "unchanged"
+
+
+def _sync_single_history(
+    history_payload: PaymentHistoryRequest,
+    db: Session,
+    *,
+    seen_at: datetime,
+    audit_source: str,
+) -> str:
+    amount_usd = _coerce_non_negative_amount(history_payload.amount_usd)
+    amount_kes = _coerce_non_negative_amount(history_payload.amount_kes)
+    status = _normalize_payment_status(history_payload.status)
+    record = db.query(PaymentHistory).filter(PaymentHistory.date == history_payload.date).first()
+
+    if record is None:
+        record = PaymentHistory(
+            date=history_payload.date,
+            amount_usd=amount_usd,
+            amount_kes=amount_kes,
+            status=status,
+            created_at=seen_at,
+            updated_at=seen_at,
+            last_seen_at=seen_at,
+            is_updated=0,
+        )
+        db.add(record)
+        db.flush()
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="history",
+            payment_id=record.id,
+            action="created",
+            new_values={
+                "date": str(record.date),
+                "amount_usd": amount_usd,
+                "amount_kes": amount_kes,
+                "status": status,
+            },
+            audit_source=audit_source,
+            auto_commit=False,
+        )
+        return "inserted"
+
+    old_values = {
+        "amount_usd": record.amount_usd,
+        "amount_kes": record.amount_kes,
+        "status": record.status,
+    }
+    new_values = {
+        "amount_usd": amount_usd,
+        "amount_kes": amount_kes,
+        "status": status,
+    }
+
+    if old_values != new_values:
+        record.amount_usd = amount_usd
+        record.amount_kes = amount_kes
+        record.status = status
+        record.updated_at = seen_at
+        record.last_seen_at = seen_at
+        record.is_updated = 1
+        record.is_flagged = 1
+        record.flag_reason = "Payment history value changed during full sync"
+        record.flagged_at = seen_at
+        AuditLogger.log_payment_change(
+            db,
+            payment_type="history",
+            payment_id=record.id,
+            action="updated",
+            old_values=old_values,
+            new_values=new_values,
+            audit_source=audit_source,
+            is_duplicate_update=True,
+            auto_commit=False,
+        )
+        return "updated"
+
+    record.last_seen_at = seen_at
+    return "unchanged"
+
+
 @router.get("/health")
 def health_check():
     return {"status": "ok", "service": "Avala Tracker Pro"}
@@ -93,6 +426,7 @@ def _update_task_fields(task: Task, payload: TaskUpdateRequest | TaskStartReques
     changed = False
     if getattr(payload, "dataset", None) and task.dataset != payload.dataset:
         task.dataset = payload.dataset
+        task.normalized_batch_name = normalize_batch_name(payload.dataset)
         changed = True
     if normalized_camera is not None and task.camera_name != normalized_camera:
         task.camera_name = normalized_camera
@@ -149,6 +483,9 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
         task = Task(
             task_uid=payload.task_uid,
             dataset=payload.dataset,
+            normalized_batch_name=normalize_batch_name(payload.dataset),
+            payment_status="unpaid",
+            paid_amount_usd=0.0,
             camera_name=normalized_camera,
             frame_start=payload.frame_start,
             frame_end=payload.frame_end,
@@ -162,6 +499,9 @@ def start_task(payload: TaskStartRequest, db: Session = Depends(get_db)):
         if _update_task_fields(task, payload, normalized_camera):
             db.commit()
             db.refresh(task)
+
+    _reconcile_task_payment_status(task, db)
+    db.commit()
 
     session = session_manager.start_session(db, payload.task_uid)
     return SessionResponse(
@@ -189,6 +529,7 @@ def update_task(payload: TaskUpdateRequest, db: Session = Depends(get_db)):
     if task is None:
         raise HTTPException(status_code=404, detail="Task not found")
     if _update_task_fields(task, payload, normalized_camera):
+        _reconcile_task_payment_status(task, db)
         db.commit()
     return GenericResponse(status="ok", detail="Task updated")
 
@@ -280,147 +621,27 @@ def sync_contributions(payload: ContributionSyncRequest, db: Session = Depends(g
 
 @router.post("/payments/add-batch", response_model=GenericResponse)
 def add_payment_batch(payload: PaymentBatchRequest, db: Session = Depends(get_db)):
-    batch_name = payload.batch_name.strip()
-    record = db.query(PaymentBatch).filter(PaymentBatch.batch_name == batch_name).first()
-    
-    if record is None:
-        record = PaymentBatch(
-            batch_name=batch_name,
-            amount_usd=max(float(payload.amount_usd or 0.0), 0.0)
-        )
-        db.add(record)
-        db.flush()  # Get the ID without committing
-        
-        # Log the creation
-        AuditLogger.log_payment_change(
-            db,
-            payment_type="batch",
-            payment_id=record.id,
-            action="created",
-            new_values={
-                "batch_name": record.batch_name,
-                "amount_usd": record.amount_usd,
-            },
-            audit_source="api",
-        )
-        detail = "Payment batch added"
-    else:
-        # Log old values before update
-        old_amount = record.amount_usd
-        new_amount = max(float(payload.amount_usd or 0.0), 0.0)
-        
-        # Check for value differences (duplicate indicator)
-        is_duplicate_update = old_amount != new_amount
-        
-        record.amount_usd = new_amount
-        
-        # Flag if values changed (indicates duplicate with different amount)
-        if is_duplicate_update:
-            record.is_flagged = 1
-            record.flag_reason = "Duplicate entry detected with updated amount"
-            record.flagged_at = datetime.utcnow()
-        
-        # Log the update
-        AuditLogger.log_payment_change(
-            db,
-            payment_type="batch",
-            payment_id=record.id,
-            action="updated",
-            old_values={"amount_usd": old_amount},
-            new_values={"amount_usd": new_amount},
-            audit_source="api",
-            is_duplicate_update=is_duplicate_update,
-        )
-        
-        detail = "Payment batch updated" + (" (duplicate flagged)" if is_duplicate_update else "")
-    
+    change_type = _sync_single_batch(payload, db, seen_at=datetime.utcnow(), audit_source="api")
     db.commit()
+    if change_type == "inserted":
+        detail = "Payment batch added"
+    elif change_type == "updated":
+        detail = "Payment batch updated (duplicate flagged)"
+    else:
+        detail = "Payment batch refreshed"
     return GenericResponse(status="ok", detail=detail)
 
 
 @router.post("/payments/add-history", response_model=GenericResponse)
 def add_payment_history(payload: PaymentHistoryRequest, db: Session = Depends(get_db)):
-    record = (
-        db.query(PaymentHistory)
-        .filter(PaymentHistory.date == payload.date)
-        .first()
-    )
-    status = (payload.status or "completed").strip().lower()
-    
-    if record is None:
-        record = PaymentHistory(
-            date=payload.date,
-            amount_usd=max(float(payload.amount_usd or 0.0), 0.0),
-            amount_kes=max(float(payload.amount_kes or 0.0), 0.0),
-            status=status,
-        )
-        db.add(record)
-        db.flush()  # Get the ID without committing
-        
-        # Log the creation
-        AuditLogger.log_payment_change(
-            db,
-            payment_type="history",
-            payment_id=record.id,
-            action="created",
-            new_values={
-                "date": str(record.date),
-                "amount_usd": record.amount_usd,
-                "amount_kes": record.amount_kes,
-                "status": record.status,
-            },
-            audit_source="api",
-        )
-        detail = "Payment history added"
-    else:
-        # Log old values before update
-        old_values = {
-            "amount_usd": record.amount_usd,
-            "amount_kes": record.amount_kes,
-            "status": record.status,
-        }
-        
-        new_usd = max(float(payload.amount_usd or 0.0), 0.0)
-        new_kes = max(float(payload.amount_kes or 0.0), 0.0)
-        
-        # Check for value differences (duplicate indicator)
-        is_duplicate_update = (
-            record.amount_usd != new_usd
-            or record.amount_kes != new_kes
-            or record.status != status
-        )
-        
-        record.amount_usd = new_usd
-        record.amount_kes = new_kes
-        record.status = status
-        
-        # Flag if values changed (indicates duplicate with different amount)
-        if is_duplicate_update:
-            record.is_flagged = 1
-            record.flag_reason = "Duplicate entry detected with updated values"
-            record.flagged_at = datetime.utcnow()
-        
-        new_values = {
-            "amount_usd": new_usd,
-            "amount_kes": new_kes,
-            "status": status,
-        }
-        
-        # Log the update
-        AuditLogger.log_payment_change(
-            db,
-            payment_type="history",
-            payment_id=record.id,
-            action="updated",
-            old_values=old_values,
-            new_values=new_values,
-            audit_source="api",
-            is_duplicate_update=is_duplicate_update,
-        )
-        
-        detail = "Payment history updated" + (" (duplicate flagged)" if is_duplicate_update else "")
-    
+    change_type = _sync_single_history(payload, db, seen_at=datetime.utcnow(), audit_source="api")
     db.commit()
+    if change_type == "inserted":
+        detail = "Payment history added"
+    elif change_type == "updated":
+        detail = "Payment history updated (duplicate flagged)"
+    else:
+        detail = "Payment history refreshed"
     return GenericResponse(status="ok", detail=detail)
 
 
@@ -439,16 +660,52 @@ def update_payment_sync_debug(payload: PaymentSyncDebugRequest, db: Session = De
     db.commit()
     return GenericResponse(status="ok", detail="Payment sync diagnostics updated")
 
+@router.post("/vision/analyze", response_model=VisionAnalyzeResponse)
+def analyze_vision(payload: VisionAnalyzeRequest, db: Session = Depends(get_db)):
+    task = None
+    if payload.task_uid:
+        task = db.query(Task).filter(Task.task_uid == payload.task_uid).first()
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+
+    try:
+        result = VisionAnalyzer.analyze_frame(
+            image_base64=payload.image_base64,
+            existing_boxes=[box.dict() for box in payload.existing_boxes] if payload.existing_boxes else [],
+            width=payload.width,
+            height=payload.height,
+            sensitivity=payload.sensitivity,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if payload.task_uid and task is not None:
+        analysis_record = VisionAnalysis(
+            task_id=task.id,
+            task_uid=task.task_uid,
+            frame_number=payload.frame_number,
+            detected_boxes=json.dumps(result.get("detected_boxes", [])),
+            suggestions=json.dumps(result.get("suggestions", [])),
+            suggestions_count=result.get("suggestions_count", 0),
+            time_saved_estimate_seconds=result.get("time_saved_estimate_seconds", 0.0),
+            image_width=payload.width,
+            image_height=payload.height,
+            processed_at=datetime.utcnow(),
+        )
+        db.add(analysis_record)
+        db.commit()
+
+    return result
+
 @router.post("/payments/sync", response_model=GenericResponse)
 def sync_payments(payload: PaymentSyncRequest, db: Session = Depends(get_db)):
-    batch_count = 0
-    history_count = 0
-    for batch in payload.recent_work:
-        add_payment_batch(batch, db)
-        batch_count += 1
-    for history in payload.payment_history:
-        add_payment_history(history, db)
-        history_count += 1
+    full_payload = PaymentFullSyncRequest(
+        batches=payload.recent_work,
+        history=payload.payment_history,
+    )
+    full_result = sync_payments_full(full_payload, db)
+    batch_count = full_result.batches.total
+    history_count = full_result.history.total
 
     debug_payload = PaymentSyncDebugRequest(
         page_detected=True,
@@ -462,6 +719,139 @@ def sync_payments(payload: PaymentSyncRequest, db: Session = Depends(get_db)):
     _upsert_payment_sync_debug(debug_payload, db)
     db.commit()
     return GenericResponse(status="ok", detail=f"Synced {batch_count} batches and {history_count} payments")
+
+
+@router.post("/payments/sync-full", response_model=PaymentFullSyncResponse)
+def sync_payments_full(payload: PaymentFullSyncRequest, db: Session = Depends(get_db)):
+    seen_at = datetime.utcnow()
+    batch_result = PaymentSyncResult()
+    history_result = PaymentSyncResult()
+    warnings: list[str] = []
+    errors: list[str] = []
+
+    try:
+        logger.info(
+            "Starting payment full sync: batches=%s history=%s",
+            len(payload.batches),
+            len(payload.history),
+        )
+        normalized_batches = []
+        for item in payload.batches:
+            batch_name = _normalize_batch_name(item.batch_name)
+            amount_usd = _coerce_non_negative_amount(item.amount_usd)
+            if not batch_name:
+                warnings.append("Skipped batch entry with missing batch_name")
+                continue
+            if not isinstance(amount_usd, float):
+                warnings.append(f"Skipped batch {batch_name}: invalid amount_usd")
+                continue
+            normalized_batches.append({
+                "batch_name": batch_name,
+                "amount_usd": amount_usd,
+            })
+
+        normalized_history = []
+        for item in payload.history:
+            amount_usd = _coerce_non_negative_amount(item.amount_usd)
+            amount_kes = _coerce_non_negative_amount(item.amount_kes)
+            normalized_history.append({
+                "date": str(item.date),
+                "amount_usd": amount_usd,
+                "amount_kes": amount_kes,
+                "status": _normalize_payment_status(item.status),
+            })
+
+        batch_map = {
+            item["batch_name"]: PaymentBatchRequest(batch_name=item["batch_name"], amount_usd=item["amount_usd"])
+            for item in normalized_batches
+        }
+        history_map = {
+            item["date"]: PaymentHistoryRequest(
+                date=date.fromisoformat(item["date"]),
+                amount_usd=item["amount_usd"],
+                amount_kes=item["amount_kes"],
+                status=item["status"],
+            )
+            for item in normalized_history
+        }
+
+        for batch in batch_map.values():
+            try:
+                change_type = _sync_single_batch(batch, db, seen_at=seen_at, audit_source="sync_full")
+                setattr(batch_result, change_type, getattr(batch_result, change_type) + 1)
+            except Exception as exc:
+                warnings.append(f"Skipped batch {batch.batch_name}: {exc}")
+
+        for history in history_map.values():
+            try:
+                change_type = _sync_single_history(history, db, seen_at=seen_at, audit_source="sync_full")
+                setattr(history_result, change_type, getattr(history_result, change_type) + 1)
+            except Exception as exc:
+                warnings.append(f"Skipped history {history.date.isoformat()}: {exc}")
+
+        batch_result.total = len(batch_map)
+        history_result.total = len(history_map)
+
+        snapshot_hash = _build_snapshot_hash(normalized_batches, normalized_history)
+        debug_payload = PaymentSyncDebugRequest(
+            page_detected=True,
+            recent_work_section_found=batch_result.total > 0,
+            payment_history_section_found=history_result.total > 0,
+            recent_work_rows=batch_result.total,
+            payment_history_rows=history_result.total,
+            last_status="synced" if (batch_result.total or history_result.total) else "waiting_for_sync",
+            backend_status_code=200,
+            page_fingerprint=snapshot_hash,
+            last_error="; ".join(warnings[:5]) if warnings else None,
+        )
+        _upsert_payment_sync_debug(debug_payload, db)
+        db.commit()
+        logger.info(
+            "Payment full sync complete: inserted=%s updated=%s unchanged=%s warnings=%s",
+            batch_result.inserted + history_result.inserted,
+            batch_result.updated + history_result.updated,
+            batch_result.unchanged + history_result.unchanged,
+            len(warnings),
+        )
+
+        return PaymentFullSyncResponse(
+            status="success",
+            detail=(
+                f"Full sync complete: {batch_result.inserted + history_result.inserted} inserted, "
+                f"{batch_result.updated + history_result.updated} updated, "
+                f"{batch_result.unchanged + history_result.unchanged} unchanged"
+            ),
+            message="Payment sync completed successfully",
+            batches=batch_result,
+            history=history_result,
+            snapshot_hash=snapshot_hash,
+            warnings=warnings,
+        )
+    except Exception as exc:
+        db.rollback()
+        errors.append(str(exc))
+        logger.exception("Payment full sync failed")
+        debug_payload = PaymentSyncDebugRequest(
+            page_detected=True,
+            recent_work_section_found=bool(payload.batches),
+            payment_history_section_found=bool(payload.history),
+            recent_work_rows=len(payload.batches),
+            payment_history_rows=len(payload.history),
+            last_status="backend_error",
+            backend_status_code=500,
+            last_error=str(exc),
+        )
+        _upsert_payment_sync_debug(debug_payload, db)
+        db.commit()
+        return PaymentFullSyncResponse(
+            status="error",
+            detail="Payment sync failed",
+            message=str(exc),
+            batches=batch_result,
+            history=history_result,
+            errors=errors,
+            warnings=warnings,
+        )
 
 
 @router.get("/payments/summary")
@@ -747,4 +1137,3 @@ def get_flagged_payments(db: Session = Depends(get_db)):
         ],
         "total_flagged": len(flagged_batches) + len(flagged_histories),
     }
-

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -89,6 +89,62 @@ class PaymentSyncRequest(BaseModel):
     payment_history: List[PaymentHistoryRequest] = Field(default_factory=list)
 
 
+class PaymentFullSyncRequest(BaseModel):
+    batches: List[PaymentBatchRequest] = Field(default_factory=list)
+    history: List[PaymentHistoryRequest] = Field(default_factory=list)
+
+
+class PaymentSyncResult(BaseModel):
+    inserted: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    total: int = 0
+
+
+class PaymentFullSyncResponse(BaseModel):
+    status: str
+    detail: str
+    batches: PaymentSyncResult
+    history: PaymentSyncResult
+    snapshot_hash: Optional[str] = None
+    message: Optional[str] = None
+    errors: List[str] = Field(default_factory=list)
+    warnings: List[str] = Field(default_factory=list)
+
+
+class BoundingBox(BaseModel):
+    label: Optional[str] = None
+    box: List[float]
+
+
+class VisionAnalyzeRequest(BaseModel):
+    image_base64: str
+    existing_boxes: List[BoundingBox] = Field(default_factory=list)
+    width: int
+    height: int
+    auto_detect: bool = False
+    task_uid: Optional[str] = None
+    frame_number: Optional[int] = None
+    sensitivity: float = Field(0.5, ge=0.0, le=1.0)
+
+
+class VisionSuggestion(BaseModel):
+    label: str
+    confidence: float
+    detected_box: List[float]
+    existing_box: Optional[List[float]] = None
+    iou: float
+    area_improvement: float
+
+
+class VisionAnalyzeResponse(BaseModel):
+    detected_boxes: List[Dict[str, Any]] = Field(default_factory=list)
+    suggestions: List[VisionSuggestion] = Field(default_factory=list)
+    suggestions_count: int
+    time_saved_estimate_seconds: float
+    processed_at: str
+
+
 class PaymentSyncDebugRequest(BaseModel):
     sync_key: str = "payments_dashboard"
     page_url: Optional[str] = None
@@ -170,4 +226,3 @@ class ReconciliationAction(BaseModel):
     action_type: str = Field(..., pattern="^(kept_primary|use_higher_value|manual_merge|ignore)$")
     action_notes: Optional[str] = None
     final_value_used: Optional[str] = None  # JSON
-

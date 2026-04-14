@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
-from backend.models import ContributionDay, ExtensionHeartbeat, FrameLog, PaymentBatch, PaymentHistory, PaymentSyncDebug
+from backend.batch_matching import extract_batch_anchor, normalize_batch_name
+from backend.models import ContributionDay, ExtensionHeartbeat, FrameLog, PaymentBatch, PaymentHistory, PaymentSyncDebug, VisionAnalysis
 from backend.models import Session as WorkSession
 from backend.models import Task
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "settings.json"
+logger = logging.getLogger(__name__)
 
 
 def _load_config() -> dict:
@@ -28,6 +31,10 @@ def _tasks_df(db: Session) -> pd.DataFrame:
             "id": t.id,
             "task_uid": t.task_uid,
             "dataset": t.dataset,
+            "normalized_batch_name": t.normalized_batch_name,
+            "payment_status": t.payment_status,
+            "paid_amount_usd": t.paid_amount_usd,
+            "payment_updated_at": t.payment_updated_at,
             "camera_name": t.camera_name,
             "frame_start": t.frame_start,
             "frame_end": t.frame_end,
@@ -64,12 +71,31 @@ def _payment_batches_df(db: Session) -> pd.DataFrame:
         [
             {
                 "batch_name": row.batch_name,
+                "normalized_batch_name": row.normalized_batch_name,
                 "amount_usd": row.amount_usd,
                 "created_at": row.created_at,
+                "updated_at": getattr(row, "updated_at", None),
             }
             for row in rows
         ]
     )
+
+
+def _dedupe_payment_batches(payment_batches: pd.DataFrame) -> pd.DataFrame:
+    if payment_batches.empty:
+        return payment_batches
+    deduped = payment_batches.copy()
+    if "normalized_batch_name" not in deduped.columns:
+        deduped["normalized_batch_name"] = deduped["batch_name"].map(normalize_batch_name)
+    deduped["normalized_batch_name"] = deduped["normalized_batch_name"].fillna("").map(normalize_batch_name)
+    deduped["updated_at_sort"] = pd.to_datetime(deduped["updated_at"], errors="coerce")
+    deduped["created_at_sort"] = pd.to_datetime(deduped["created_at"], errors="coerce")
+    deduped = deduped.sort_values(
+        ["normalized_batch_name", "updated_at_sort", "created_at_sort", "amount_usd"],
+        ascending=[True, False, False, False],
+    )
+    deduped = deduped.drop_duplicates(subset=["normalized_batch_name"], keep="first")
+    return deduped.drop(columns=["updated_at_sort", "created_at_sort"], errors="ignore")
 
 
 def _payment_history_df(db: Session) -> pd.DataFrame:
@@ -139,10 +165,31 @@ def _frame_counts(db: Session, today_str: str) -> dict:
     }
 
 
+def _database_schema_status(db: Session) -> dict:
+    try:
+        rows = db.execute(text("PRAGMA table_info(payments_batches)")).fetchall()
+        columns = {row[1] for row in rows}
+        if "updated_at" in columns and "normalized_batch_name" in columns:
+            return {
+                "schema_status": "ok",
+                "schema_status_message": "Database schema is up to date.",
+            }
+        return {
+            "schema_status": "needs_migration",
+            "schema_status_message": "Missing normalized payment batch fields; restart the backend to migrate the schema.",
+        }
+    except Exception as exc:
+        return {
+            "schema_status": "unknown",
+            "schema_status_message": f"Schema status check failed: {exc}",
+        }
+
+
 def compute_payment_metrics(db: Session) -> dict:
     tasks = _tasks_df(db)
     sessions = _sessions_df(db)
     payment_batches = _payment_batches_df(db)
+    payment_batches = _dedupe_payment_batches(payment_batches)
     payment_history = _payment_history_df(db)
 
     extension_status = {}
@@ -175,7 +222,27 @@ def compute_payment_metrics(db: Session) -> dict:
             "last_success_at": debug_record.last_success_at.isoformat() if debug_record.last_success_at else None,
         }
 
+    vision_rows = db.query(VisionAnalysis).all()
+    vision_df = pd.DataFrame(
+        [
+            {
+                "task_uid": row.task_uid,
+                "frame_number": row.frame_number,
+                "suggestions_count": row.suggestions_count,
+                "time_saved_estimate_seconds": row.time_saved_estimate_seconds,
+            }
+            for row in vision_rows
+        ]
+    )
+
+    schema_status = _database_schema_status(db)
     if payment_batches.empty and payment_history.empty:
+        suggestion_summary = {
+            "vision_suggestions_total": int(vision_df["suggestions_count"].sum()) if not vision_df.empty else 0,
+            "vision_frames_assisted": int(len(vision_df)) if not vision_df.empty else 0,
+            "vision_time_saved_minutes": round(float(vision_df["time_saved_estimate_seconds"].sum()) / 60.0, 2) if not vision_df.empty else 0.0,
+            "vision_suggestions_per_task": [] if vision_df.empty else vision_df.groupby("task_uid", as_index=False)["suggestions_count"].sum().rename(columns={"suggestions_count": "suggestions_total"}).to_dict(orient="records"),
+        }
         return {
             "total_earnings_usd": 0.0,
             "total_paid_kes": 0.0,
@@ -195,10 +262,13 @@ def compute_payment_metrics(db: Session) -> dict:
             "payment_sync_status": str(payment_sync_debug.get("last_status") or "waiting_for_sync"),
             "payment_sync_debug": payment_sync_debug,
             "extension_status": extension_status,
+            "schema_status": schema_status.get("schema_status"),
+            "schema_status_message": schema_status.get("schema_status_message"),
             "unpaid_batches": [],
             "unpaid_batch_count": 0,
             "unpaid_frames_total": 0,
             "unpaid_hours_total": 0.0,
+            **suggestion_summary,
         }
 
     total_earnings = float(payment_batches["amount_usd"].sum()) if not payment_batches.empty else 0.0
@@ -225,10 +295,13 @@ def compute_payment_metrics(db: Session) -> dict:
         usd_vs_kes = []
 
     if not payment_batches.empty:
-        earnings_per_batch_df = payment_batches.groupby("batch_name", as_index=False).agg(amount_usd=("amount_usd", "sum"))
+        if "normalized_batch_name" not in payment_batches.columns:
+            payment_batches["normalized_batch_name"] = payment_batches["batch_name"].map(normalize_batch_name)
+        earnings_per_batch_df = payment_batches.groupby("normalized_batch_name", as_index=False).agg(amount_usd=("amount_usd", "sum"))
+        earnings_per_batch_df["batch_name"] = earnings_per_batch_df["normalized_batch_name"]
         earnings_per_batch = earnings_per_batch_df.sort_values("amount_usd", ascending=False).to_dict(orient="records")
     else:
-        earnings_per_batch_df = pd.DataFrame(columns=["batch_name", "amount_usd"])
+        earnings_per_batch_df = pd.DataFrame(columns=["batch_name", "normalized_batch_name", "amount_usd"])
         earnings_per_batch = []
 
     total_tasks = int(len(tasks)) if not tasks.empty else 0
@@ -260,27 +333,55 @@ def compute_payment_metrics(db: Session) -> dict:
         task_summary_df = task_summary_df.merge(session_hours_df, on="dataset", how="left")
         task_summary_df["hours"] = task_summary_df["hours"].fillna(0.0)
 
-    paid_batch_summary_df = pd.DataFrame(columns=["batch_name", "amount_usd", "paid_entries"])
+    paid_batch_summary_df = pd.DataFrame(columns=["batch_name", "normalized_batch_name", "amount_usd", "paid_entries"])
     paid_batch_names = set()
+    paid_batch_anchor_map: dict[str, list[str]] = {}
     if not payment_batches.empty:
         payment_batches["batch_name"] = payment_batches["batch_name"].astype(str)
-        paid_batch_summary_df = payment_batches.groupby("batch_name", as_index=False).agg(
+        if "normalized_batch_name" not in payment_batches.columns:
+            payment_batches["normalized_batch_name"] = payment_batches["batch_name"].map(normalize_batch_name)
+        payment_batches["normalized_batch_name"] = payment_batches["normalized_batch_name"].fillna("").map(normalize_batch_name)
+        paid_batch_summary_df = payment_batches.groupby(["batch_name", "normalized_batch_name"], as_index=False).agg(
             amount_usd=("amount_usd", "sum"),
             paid_entries=("amount_usd", "count"),
         )
-        paid_batch_names = set(paid_batch_summary_df["batch_name"].tolist())
+        paid_batch_names = set(paid_batch_summary_df["normalized_batch_name"].tolist())
+        for normalized_name in paid_batch_summary_df["normalized_batch_name"].tolist():
+            anchor = extract_batch_anchor(normalized_name)
+            if not anchor:
+                continue
+            paid_batch_anchor_map.setdefault(anchor, []).append(normalized_name)
 
     if not task_summary_df.empty:
         tracked_batches_df = task_summary_df.copy().rename(
             columns={"dataset": "batch_name", "frames": "frames_logged", "hours": "hours_spent"}
         )
+        tracked_batches_df["normalized_batch_name"] = tracked_batches_df["batch_name"].map(normalize_batch_name)
         tracked_batches_df["hours_spent"] = tracked_batches_df["hours_spent"].fillna(0.0).round(2)
-        tracked_batches_df = tracked_batches_df.merge(paid_batch_summary_df, on="batch_name", how="left")
+        tracked_batches_df = tracked_batches_df.merge(
+            paid_batch_summary_df[["normalized_batch_name", "amount_usd", "paid_entries"]],
+            on="normalized_batch_name",
+            how="left",
+        )
         tracked_batches_df["amount_usd"] = tracked_batches_df["amount_usd"].fillna(0.0).round(2)
         tracked_batches_df["paid_entries"] = tracked_batches_df["paid_entries"].fillna(0).astype(int)
-        tracked_batches_df["payment_status"] = tracked_batches_df["batch_name"].isin(paid_batch_names).map(
-            lambda value: "Paid" if value else "Unpaid"
-        )
+
+        def resolve_paid_status(row: pd.Series) -> str:
+            normalized_name = normalize_batch_name(row.get("normalized_batch_name"))
+            if normalized_name in paid_batch_names:
+                return "Paid"
+            anchor = extract_batch_anchor(normalized_name)
+            if anchor and len(set(paid_batch_anchor_map.get(anchor, []))) == 1:
+                candidate_name = paid_batch_anchor_map[anchor][0]
+                candidate_row = paid_batch_summary_df[paid_batch_summary_df["normalized_batch_name"] == candidate_name]
+                if not candidate_row.empty:
+                    tracked_batches_df.loc[row.name, "amount_usd"] = round(float(candidate_row.iloc[0]["amount_usd"]), 2)
+                    tracked_batches_df.loc[row.name, "paid_entries"] = int(candidate_row.iloc[0]["paid_entries"])
+                    logger.info("Matched %s -> %s", candidate_name, row.get("batch_name"))
+                    return "Paid"
+            return "Unpaid"
+
+        tracked_batches_df["payment_status"] = tracked_batches_df.apply(resolve_paid_status, axis=1)
         tracked_batches_df["last_tracked_at"] = tracked_batches_df["last_tracked_at"].astype(str)
         tracked_batches_df = tracked_batches_df.sort_values(
             ["payment_status", "last_tracked_at", "frames_logged"],
@@ -302,8 +403,9 @@ def compute_payment_metrics(db: Session) -> dict:
             task_hours = joined.groupby("dataset", as_index=False).agg(hours=("active_minutes", lambda x: float(x.fillna(0).sum()) / 60.0))
         else:
             task_hours = pd.DataFrame(columns=["dataset", "hours"])
+        task_hours["normalized_batch_name"] = task_hours["dataset"].map(normalize_batch_name)
 
-        profitability_df = earnings_per_batch_df.merge(task_hours, left_on="batch_name", right_on="dataset", how="left")
+        profitability_df = earnings_per_batch_df.merge(task_hours, on="normalized_batch_name", how="left")
         profitability_df["hours"] = profitability_df["hours"].fillna(0.0)
         profitability_df["profit_per_hour"] = profitability_df.apply(
             lambda row: round(float(row["amount_usd"]) / float(row["hours"]), 2) if float(row["hours"]) > 0 else 0.0,
@@ -329,10 +431,12 @@ def compute_payment_metrics(db: Session) -> dict:
     recent_work_synced_count = int(len(payment_batches)) if not payment_batches.empty else 0
     payment_history_synced_count = int(len(payment_history)) if not payment_history.empty else 0
     last_recent_work_sync_at = None
-    if not payment_batches.empty and "created_at" in payment_batches.columns:
-        created_at_series = pd.to_datetime(payment_batches["created_at"], errors="coerce").dropna()
-        if not created_at_series.empty:
-            last_recent_work_sync_at = created_at_series.max().isoformat()
+    if not payment_batches.empty:
+        created_at_series = pd.to_datetime(payment_batches["created_at"], errors="coerce").dropna() if "created_at" in payment_batches.columns else pd.Series(dtype="datetime64[ns]")
+        updated_at_series = pd.to_datetime(payment_batches["updated_at"], errors="coerce").dropna() if "updated_at" in payment_batches.columns else pd.Series(dtype="datetime64[ns]")
+        all_sync_times = pd.concat([created_at_series, updated_at_series], ignore_index=True)
+        if not all_sync_times.empty:
+            last_recent_work_sync_at = all_sync_times.max().isoformat()
     last_payment_history_date = None
     if not payment_history.empty and "date" in payment_history.columns:
         date_series = pd.to_datetime(payment_history["date"], errors="coerce").dropna()
@@ -368,6 +472,13 @@ def compute_payment_metrics(db: Session) -> dict:
             "last_success_at": debug_record.last_success_at.isoformat() if debug_record.last_success_at else None,
         }
 
+    suggestion_summary = {
+        "vision_suggestions_total": int(vision_df["suggestions_count"].sum()) if not vision_df.empty else 0,
+        "vision_frames_assisted": int(len(vision_df)) if not vision_df.empty else 0,
+        "vision_time_saved_minutes": round(float(vision_df["time_saved_estimate_seconds"].sum()) / 60.0, 2) if not vision_df.empty else 0.0,
+        "vision_suggestions_per_task": [] if vision_df.empty else vision_df.groupby("task_uid", as_index=False)["suggestions_count"].sum().rename(columns={"suggestions_count": "suggestions_total"}).to_dict(orient="records"),
+    }
+
     payment_sync_status = "synced" if (recent_work_synced_count or payment_history_synced_count) else "waiting_for_sync"
     if payment_sync_debug and payment_sync_status == "waiting_for_sync":
         payment_sync_status = str(payment_sync_debug.get("last_status") or payment_sync_status)
@@ -382,6 +493,7 @@ def compute_payment_metrics(db: Session) -> dict:
         except ValueError:
             payment_sync_status = payment_sync_status
 
+    schema_status = _database_schema_status(db)
     return {
         "total_earnings_usd": round(total_earnings, 2),
         "total_paid_kes": round(total_paid_kes, 2),
@@ -401,10 +513,13 @@ def compute_payment_metrics(db: Session) -> dict:
         "payment_sync_status": payment_sync_status,
         "payment_sync_debug": payment_sync_debug,
         "extension_status": extension_status,
+        "schema_status": schema_status.get("schema_status"),
+        "schema_status_message": schema_status.get("schema_status_message"),
         "unpaid_batches": unpaid_batches,
         "unpaid_batch_count": unpaid_batch_count,
         "unpaid_frames_total": unpaid_frames_total,
         "unpaid_hours_total": unpaid_hours_total,
+        **suggestion_summary,
     }
 
 

@@ -14,6 +14,10 @@ class Task(Base):
     id = Column(Integer, primary_key=True, index=True)
     task_uid = Column(String, unique=True, index=True, nullable=False)
     dataset = Column(String, nullable=False)
+    normalized_batch_name = Column(String, index=True, nullable=True)
+    payment_status = Column(String, nullable=False, default="unpaid")
+    paid_amount_usd = Column(Float, nullable=False, default=0.0)
+    payment_updated_at = Column(DateTime, nullable=True)
     camera_name = Column(String, nullable=True)
     frame_start = Column(Integer, nullable=False, default=0)
     frame_end = Column(Integer, nullable=False, default=0)
@@ -54,6 +58,24 @@ class FrameLog(Base):
     task = relationship("Task", back_populates="frame_logs")
 
 
+class VisionAnalysis(Base):
+    __tablename__ = "vision_analysis"
+
+    id = Column(Integer, primary_key=True, index=True)
+    task_id = Column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)
+    task_uid = Column(String, nullable=True, index=True)
+    frame_number = Column(Integer, nullable=True)
+    detected_boxes = Column(String, nullable=True)
+    suggestions = Column(String, nullable=True)
+    suggestions_count = Column(Integer, default=0, nullable=False)
+    time_saved_estimate_seconds = Column(Float, default=0.0, nullable=False)
+    image_width = Column(Integer, default=0, nullable=False)
+    image_height = Column(Integer, default=0, nullable=False)
+    processed_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    task = relationship("Task")
+
+
 class ContributionDay(Base):
     __tablename__ = "contribution_days"
 
@@ -69,8 +91,12 @@ class PaymentBatch(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     batch_name = Column(String, index=True, nullable=False)
+    normalized_batch_name = Column(String, index=True, nullable=True)
     amount_usd = Column(Float, nullable=False, default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    is_updated = Column(Integer, default=0, nullable=False)
     is_flagged = Column(Integer, default=0, nullable=False)
     flag_reason = Column(String, nullable=True)
     flagged_at = Column(DateTime, nullable=True)
@@ -84,6 +110,10 @@ class PaymentHistory(Base):
     amount_usd = Column(Float, nullable=False, default=0.0)
     amount_kes = Column(Float, nullable=True, default=0.0)
     status = Column(String, nullable=False, default="completed")
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    last_seen_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    is_updated = Column(Integer, default=0, nullable=False)
     is_flagged = Column(Integer, default=0, nullable=False)
     flag_reason = Column(String, nullable=True)
     flagged_at = Column(DateTime, nullable=True)
